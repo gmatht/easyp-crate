@@ -167,7 +167,7 @@ struct OnDemandHttpsServer {
     http_challenges: Arc<Mutex<BTreeMap<String, String>>>, // token -> key_authorization
     acme_client: Option<Arc<AcmeClient>>, // Added for challenge storage
     allowed_ips: Vec<IpAddr>, // Store allowed IPs for display
-    extension_registry: ExtensionRegistry, // Extension system
+    extension_registry: Arc<Mutex<ExtensionRegistry>>, // Extension system
     secure_file_server: SecureFileServer, // Secure file serving with security features
 }
 
@@ -388,32 +388,37 @@ impl OnDemandHttpsServer {
                        }
                    });
                
-               // Initialize root extensions and admin system before dropping privileges
-               #[cfg(feature = "extensions")]
-               {
-                   println!("Initializing root extensions and admin system...");
-                   let mut extension_registry = ExtensionRegistry::new();
-                   
-                   // Load existing admin keys from file
-                   if let Err(e) = extension_registry.load_existing_admin_keys() {
-                       println!("Warning: Failed to load existing admin keys: {}", e);
-                   }
-                   
-                   // Generate missing admin keys and append to file
-                   if let Err(e) = extension_registry.generate_missing_admin_keys() {
-                       println!("Warning: Failed to generate missing admin keys: {}", e);
-                   }
-                   
-                   // Ensure admin file has correct permissions
-                   if let Err(e) = extension_registry.ensure_admin_file_permissions() {
-                       println!("Warning: Failed to set admin file permissions: {}", e);
-                   }
-                   
-                   // Initialize root extensions
-                   if let Err(e) = extension_registry.initialize_root_extensions() {
-                       println!("Warning: Failed to initialize root extensions: {}", e);
-                   }
-               }
+                // Initialize root extensions and admin system before dropping privileges
+                #[cfg(feature = "extensions")]
+                let extension_registry = {
+                    println!("Initializing root extensions and admin system...");
+                    let mut registry = ExtensionRegistry::new();
+                    
+                    // Load existing admin keys from file
+                    if let Err(e) = registry.load_existing_admin_keys() {
+                        println!("Warning: Failed to load existing admin keys: {}", e);
+                    }
+                    
+                    // Generate missing admin keys and append to file
+                    if let Err(e) = registry.generate_missing_admin_keys() {
+                        println!("Warning: Failed to generate missing admin keys: {}", e);
+                    }
+                    
+                    // Ensure admin file has correct permissions
+                    if let Err(e) = registry.ensure_admin_file_permissions() {
+                        println!("Warning: Failed to set admin file permissions: {}", e);
+                    }
+                    
+                    // Initialize root extensions
+                    if let Err(e) = registry.initialize_root_extensions() {
+                        println!("Warning: Failed to initialize root extensions: {}", e);
+                    }
+                    
+                    Arc::new(Mutex::new(registry))
+                };
+                
+                #[cfg(not(feature = "extensions"))]
+                let extension_registry = Arc::new(Mutex::new(ExtensionRegistry::new()));
                
                // Drop privileges to unprivileged user after binding to privileged ports
                if let Err(e) = secure_file_server.drop_privileges() {
@@ -445,7 +450,7 @@ impl OnDemandHttpsServer {
                    http_challenges: Arc::new(Mutex::new(BTreeMap::new())),
                    acme_client,
                    allowed_ips,
-                   extension_registry: ExtensionRegistry::new(),
+                   extension_registry,
                    secure_file_server,
                })
     }
@@ -575,7 +580,7 @@ impl OnDemandHttpsServer {
         acme_client: Option<Arc<AcmeClient>>,
         http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
         secure_file_server: SecureFileServer,
-        extension_registry: ExtensionRegistry,
+        extension_registry: Arc<Mutex<ExtensionRegistry>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Read HTTP request
         let mut buffer = [0; 4096];
@@ -610,6 +615,9 @@ impl OnDemandHttpsServer {
         let request = String::from_utf8_lossy(&buffer[..total_read]);
         let lines: Vec<&str> = request.lines().collect();
 
+        println!("DEBUG: HTTP connection - total_read: {}", total_read);
+        println!("DEBUG: HTTP request (first 200 bytes): {}", &request[..std::cmp::min(200, request.len())]);
+
         if let Some(first_line) = lines.first() {
             println!("HTTP Request: {}", first_line);
 
@@ -635,6 +643,7 @@ impl OnDemandHttpsServer {
         };
 
         println!("Requested path: {}", request_path);
+        println!("DEBUG: Full request: {}", request);
 
         // Check for bin extension requests (CGI-like)
         if request_path.starts_with("/cgi-bin/") {
@@ -663,7 +672,7 @@ impl OnDemandHttpsServer {
             }
             
             // Handle bin extension request
-            match extension_registry.handle_bin_request(bin_path, "GET", query_string, &headers) {
+            match extension_registry.lock().unwrap().handle_bin_request(bin_path, "GET", query_string, &headers) {
                 Ok(response) => {
                     stream.write_all(response.as_bytes())?;
                     stream.flush()?;
@@ -689,8 +698,14 @@ impl OnDemandHttpsServer {
         // Check for admin extension requests
         #[cfg(feature = "extensions")]
         {
+            println!("DEBUG: Checking for admin request with path: {}", request_path);
+            println!("DEBUG: Admin request check: comment_={}, math_={}, example_={}", 
+                request_path.starts_with("/comment_"),
+                request_path.starts_with("/math_"),
+                request_path.starts_with("/example_"));
             // Check if this looks like an admin request (starts with /comment_, /math_, etc.)
             if request_path.starts_with("/comment_") || request_path.starts_with("/math_") || request_path.starts_with("/example_") {
+                println!("DEBUG: Admin request detected for path: {}", request_path);
                 // Extract query string from the request
                 let query_string = if let Some(query_start) = request_path.find('?') {
                     &request_path[query_start + 1..]
@@ -716,7 +731,7 @@ impl OnDemandHttpsServer {
                 }
                 
                 // Handle admin extension request
-                match tokio::runtime::Handle::current().block_on(extension_registry.process_admin_request(admin_path, "GET", query_string, "", &headers)) {
+                match extension_registry.lock().unwrap().process_admin_request(admin_path, "GET", query_string, "", &headers) {
                     Ok(response) => {
                         stream.write_all(response.as_bytes())?;
                         stream.flush()?;
@@ -760,7 +775,7 @@ impl OnDemandHttpsServer {
                             // Process extensions in the HTML content
                             #[cfg(feature = "extensions")]
                             {
-                                let processed_html = extension_registry.process_html(&content_string, request_path);
+                                let processed_html = extension_registry.lock().unwrap().process_html(&content_string, request_path);
                                 processed_content = processed_html.into_bytes();
                             }
                         }
@@ -882,7 +897,7 @@ impl OnDemandHttpsServer {
         args: Args,
         acme_client: Option<Arc<AcmeClient>>,
         http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
-        extension_registry: ExtensionRegistry,
+        extension_registry: Arc<Mutex<ExtensionRegistry>>,
         secure_file_server: SecureFileServer,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut acceptor = Acceptor::default();
@@ -949,7 +964,7 @@ impl OnDemandHttpsServer {
         args: Args,
         acme_client: Option<Arc<AcmeClient>>,
         http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
-        extension_registry: ExtensionRegistry,
+        extension_registry: Arc<Mutex<ExtensionRegistry>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut acceptor = Acceptor::default();
 
@@ -1012,7 +1027,7 @@ impl OnDemandHttpsServer {
         server_name: &str,
         acme_client: &Option<Arc<AcmeClient>>,
         http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
-        extension_registry: &ExtensionRegistry,
+        extension_registry: &Arc<Mutex<ExtensionRegistry>>,
         secure_file_server: &SecureFileServer,
     ) -> Result<(), Box<dyn std::error::Error>> {
         println!("🔍 process_https_request_static started for domain: {}", server_name);
@@ -1131,7 +1146,7 @@ impl OnDemandHttpsServer {
                             // Process extensions in the HTML content
                             #[cfg(feature = "extensions")]
                             {
-                                let processed_html = extension_registry.process_html(&content_string, request_path);
+                                let processed_html = extension_registry.lock().unwrap().process_html(&content_string, request_path);
                                 processed_content = processed_html.into_bytes();
                             }
                         }
@@ -1244,7 +1259,7 @@ impl OnDemandHttpsServer {
         server_name: &str,
         acme_client: &Option<Arc<AcmeClient>>,
         http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
-        extension_registry: &ExtensionRegistry,
+        extension_registry: &Arc<Mutex<ExtensionRegistry>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Complete the handshake
         conn.complete_io(stream)?;

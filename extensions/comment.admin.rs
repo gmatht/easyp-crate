@@ -464,8 +464,11 @@ pub fn handle_comment_admin_request(
     }
     
     // Get admin key from memory and validate
+    println!("DEBUG: Admin keys map: {:?}", admin_keys);
+    println!("DEBUG: Looking for 'comment' key in admin_keys");
     let admin_key = admin_keys.get("comment")
         .ok_or("Comment admin key not found".to_string())?;
+    println!("DEBUG: Found admin key: {}", admin_key);
     let expected_path = format!("/comment_{}", admin_key);
     
     if path != expected_path {
@@ -514,8 +517,23 @@ pub fn handle_comment_admin_request(
     // Handle GET requests (display admin panel)
     if method == "GET" {
         // Move comments from 'in' to 'processing' only when viewing the moderation input page
-        move_comments_to_processing()?;
-        let comments = get_comments()?;
+        if let Err(e) = move_comments_to_processing() {
+            return Ok(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<h1>Admin Panel</h1><p>Error moving comments: {}</p>",
+                e
+            ));
+        }
+        
+        let comments = match get_comments() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<h1>Admin Panel</h1><p>Error getting comments: {}</p>",
+                    e
+                ));
+            }
+        };
+        
         let html = generate_admin_panel(&comments);
         
         return Ok(format!(
