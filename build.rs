@@ -211,7 +211,7 @@ fn main() -> std::io::Result<()> {
     out.push_str("                let mut hasher = DefaultHasher::new();\n");
     out.push_str("                std::time::SystemTime::now().hash(&mut hasher);\n");
     out.push_str("                ext.hash(&mut hasher);\n");
-    out.push_str("                let key = format!(\"{:x}\", hasher.finish())[..8].to_string();\n");
+    out.push_str("                let key = format!(\"{:016x}\", hasher.finish());\n");
     out.push_str("                self.admin_keys.insert(ext.to_string(), key);\n");
     out.push_str("                needs_save = true;\n");
     out.push_str("            }\n");
