@@ -36,6 +36,17 @@ use secure_file_server_module::{SecureFileServer, SecurityConfig};
 #[cfg(feature = "extensions")]
 include!(concat!(env!("OUT_DIR"), "/generated_extensions.rs"));
 
+// Debug: Check if extensions feature is enabled
+#[cfg(feature = "extensions")]
+fn debug_extensions_enabled() {
+    println!("DEBUG: Extensions feature is ENABLED");
+}
+
+#[cfg(not(feature = "extensions"))]
+fn debug_extensions_enabled() {
+    println!("DEBUG: Extensions feature is DISABLED");
+}
+
 // Always define ExtensionRegistry - either from generated code or as placeholder
 #[cfg(not(feature = "extensions"))]
 #[derive(Clone)]
@@ -1833,6 +1844,7 @@ fn parse_allowed_ips(ips_str: &str) -> Result<Vec<IpAddr>, Box<dyn std::error::E
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 EasyPeas HTTPS Server starting - Debug version with enhanced ACME integration");
+    debug_extensions_enabled();
     let args = Args::parse();
 
     // Initialize logging
