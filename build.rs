@@ -105,14 +105,18 @@ fn main() -> std::io::Result<()> {
 
     // Generate ExtensionRegistry
     out.push_str("pub struct ExtensionRegistry {\n");
-    out.push_str("    // Extension registry implementation\n");
+    out.push_str("    admin_keys: std::collections::HashMap<String, String>,\n");
     out.push_str("}\n\n");
 
     out.push_str("impl ExtensionRegistry {\n");
     out.push_str("    pub fn new() -> Self {\n");
-    out.push_str("        Self {\n");
-    out.push_str("            // Initialize extension registry\n");
-    out.push_str("        }\n");
+    out.push_str("        let mut registry = Self {\n");
+    out.push_str("            admin_keys: std::collections::HashMap::new(),\n");
+    out.push_str("        };\n");
+    out.push_str("        // Load admin keys on initialization\n");
+    out.push_str("        let _ = registry.load_existing_admin_keys();\n");
+    out.push_str("        let _ = registry.generate_missing_admin_keys();\n");
+    out.push_str("        registry\n");
     out.push_str("    }\n\n");
 
     out.push_str("    pub fn process_html(&self, html: &str, url: &str) -> String {\n");
@@ -121,13 +125,113 @@ fn main() -> std::io::Result<()> {
     out.push_str("    }\n\n");
 
     out.push_str("    pub fn is_valid_admin_key(&self, key: &str) -> bool {\n");
-    out.push_str("        // Validate admin key\n");
-    out.push_str("        false\n");
+    out.push_str("        self.admin_keys.values().any(|k| k == key)\n");
     out.push_str("    }\n\n");
 
-    out.push_str("    pub async fn process_admin_request(&self, path: &str, query: &str, body: &str, headers: &std::collections::HashMap<String, String>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {\n");
-    out.push_str("        // Process admin request\n");
-    out.push_str("        Ok(r#\"{\\\"error\\\": \\\"Admin features not available\\\"}\"#.to_string())\n");
+    out.push_str("    pub fn process_admin_request(&self, path: &str, query: &str, body: &str, headers: &std::collections::HashMap<String, String>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {\n");
+    out.push_str("        // Process admin request by checking for admin extensions\n");
+    out.push_str("        println!(\"DEBUG: Processing admin request for path: {}\", path);\n");
+    out.push_str("        println!(\"DEBUG: Available admin keys: {:?}\", self.admin_keys);\n");
+    out.push_str("        for (ext_name, key) in &self.admin_keys {\n");
+    out.push_str("            let admin_prefix = format!(\"/{}_\", ext_name);\n");
+    out.push_str("            println!(\"DEBUG: Checking prefix {} with key {}\", admin_prefix, key);\n");
+    out.push_str("            if path.starts_with(&admin_prefix) {\n");
+    out.push_str("                match ext_name.as_str() {\n");
+    out.push_str("                    \"comment\" => {\n");
+    out.push_str("                        println!(\"DEBUG: Routing to comment admin with key: {}\", key);\n");
+    out.push_str("                        return comment_admin::handle_comment_admin_request(path, \"GET\", query, body, headers, &self.admin_keys)\n");
+    out.push_str("                            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>);\n");
+    out.push_str("                    }\n");
+    out.push_str("                    _ => continue,\n");
+    out.push_str("                }\n");
+    out.push_str("            }\n");
+    out.push_str("        }\n");
+    out.push_str("        println!(\"DEBUG: No matching admin extension found for path: {}\", path);\n");
+    out.push_str("        Ok(r#\"{\\\"error\\\": \\\"Admin path not found\\\"}\"#.to_string())\n");
+    out.push_str("    }\n\n");
+
+    // Add missing methods that the main code expects
+    out.push_str("    pub fn load_existing_admin_keys(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {\n");
+    out.push_str("        // Load existing admin keys from file system\n");
+    out.push_str("        let admin_keys_file = std::path::Path::new(\"/var/lib/easypeas/admin_keys\");\n");
+    out.push_str("        if admin_keys_file.exists() {\n");
+    out.push_str("            if let Ok(content) = std::fs::read_to_string(admin_keys_file) {\n");
+    out.push_str("                for line in content.lines() {\n");
+    out.push_str("                    let line = line.trim();\n");
+    out.push_str("                    if line.is_empty() {\n");
+    out.push_str("                        continue;\n");
+    out.push_str("                    }\n");
+    out.push_str("                    // Handle both formats: 'key=value' and 'key_value'\n");
+    out.push_str("                    if let Some((key, value)) = line.split_once('=') {\n");
+    out.push_str("                        self.admin_keys.insert(key.to_string(), value.to_string());\n");
+    out.push_str("                    } else if line.contains('_') {\n");
+    out.push_str("                        // Handle format like 'comment_8c6cbb89bff8b444'\n");
+    out.push_str("                        if let Some(underscore_pos) = line.find('_') {\n");
+    out.push_str("                            let key = &line[..underscore_pos];\n");
+    out.push_str("                            let value = &line[underscore_pos + 1..];\n");
+    out.push_str("                            self.admin_keys.insert(key.to_string(), value.to_string());\n");
+    out.push_str("                        }\n");
+    out.push_str("                    }\n");
+    out.push_str("                }\n");
+    out.push_str("            }\n");
+    out.push_str("        }\n");
+    out.push_str("        Ok(())\n");
+    out.push_str("    }\n\n");
+
+    out.push_str("    pub fn generate_missing_admin_keys(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {\n");
+    out.push_str("        // Only generate keys for extensions that don't already exist\n");
+    out.push_str("        // This ensures stored keys are always preserved\n");
+    out.push_str("        let admin_extensions = vec![\"comment\"];\n");
+    out.push_str("        let mut needs_save = false;\n");
+    out.push_str("        \n");
+    out.push_str("        for ext in admin_extensions {\n");
+    out.push_str("            if !self.admin_keys.contains_key(ext) {\n");
+    out.push_str("                use std::collections::hash_map::DefaultHasher;\n");
+    out.push_str("                use std::hash::{Hash, Hasher};\n");
+    out.push_str("                let mut hasher = DefaultHasher::new();\n");
+    out.push_str("                std::time::SystemTime::now().hash(&mut hasher);\n");
+    out.push_str("                ext.hash(&mut hasher);\n");
+    out.push_str("                let key = format!(\"{:x}\", hasher.finish())[..8].to_string();\n");
+    out.push_str("                self.admin_keys.insert(ext.to_string(), key);\n");
+    out.push_str("                needs_save = true;\n");
+    out.push_str("            }\n");
+    out.push_str("        }\n");
+    out.push_str("        \n");
+    out.push_str("                if needs_save {\n");
+        out.push_str("            let admin_keys_file = std::path::Path::new(\"/var/lib/easypeas/admin_keys\");\n");
+    out.push_str("            if let Some(parent) = admin_keys_file.parent() {\n");
+    out.push_str("                let _ = std::fs::create_dir_all(parent);\n");
+    out.push_str("            }\n");
+    out.push_str("            let mut content = String::new();\n");
+    out.push_str("            for (k, v) in &self.admin_keys {\n");
+    out.push_str("                content.push_str(&format!(\"{}={}\\n\", k, v));\n");
+    out.push_str("            }\n");
+    out.push_str("            let _ = std::fs::write(admin_keys_file, content);\n");
+    out.push_str("        }\n");
+    out.push_str("        Ok(())\n");
+    out.push_str("    }\n\n");
+
+    out.push_str("    pub fn ensure_admin_file_permissions(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {\n");
+    out.push_str("        // Ensure admin file permissions\n");
+    out.push_str("        Ok(())\n");
+    out.push_str("    }\n\n");
+
+    out.push_str("    pub fn initialize_root_extensions(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {\n");
+    out.push_str("        // Initialize root extensions\n");
+    out.push_str("        Ok(())\n");
+    out.push_str("    }\n\n");
+
+    out.push_str("    pub fn handle_bin_request(&self, bin_path: &str, method: &str, query_string: &str, headers: &std::collections::HashMap<String, String>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {\n");
+    out.push_str("        // Handle bin request\n");
+    out.push_str("        match bin_path {\n");
+    out.push_str("            \"/cgi-bin/comment\" => {\n");
+    out.push_str("                comment_bin::handle_comment_request(method, bin_path, \"localhost\", query_string, headers)\n");
+    out.push_str("                    .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)\n");
+    out.push_str("            }\n");
+    out.push_str("            _ => {\n");
+    out.push_str("                Err(Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, \"Bin extension not found\")) as Box<dyn std::error::Error + Send + Sync>)\n");
+    out.push_str("            }\n");
+    out.push_str("        }\n");
     out.push_str("    }\n");
     out.push_str("}\n");
 

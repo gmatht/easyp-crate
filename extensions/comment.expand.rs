@@ -38,7 +38,7 @@ pub fn extend(url: &str, args: &str) -> String {
     {}
     <div class="comment-form" style="margin: 20px 0; padding: 20px; border: 1px solid #ddd; border-radius: 5px; background-color: #f9f9f9;">
     <h3>Leave a Comment</h3>
-    <form action="/cgi-bin/comment" method="GET" style="display: flex; flex-direction: column; gap: 10px;">
+    <form action="/cgi-bin/comment?" method="GET" style="display: flex; flex-direction: column; gap: 10px;">
         <input type="hidden" name="return_url" value="{}">
         
         <div style="display: flex; flex-direction: column;">
@@ -259,7 +259,7 @@ pub fn extend(url: &str, args: &str) -> String {
         
         // Add some basic form validation
         document.addEventListener('DOMContentLoaded', function() {{
-            const form = document.querySelector('form[action="/cgi-bin/comment"]');
+            const form = document.querySelector('form[action="/cgi-bin/comment?"]');
             if (form) {{
                 form.addEventListener('submit', function(e) {{
                     const user = document.getElementById('comment_user').value.trim();
@@ -459,7 +459,7 @@ mod tests {
     fn test_comment_form_generation() {
         let result = extend("https://example.com/page", "");
         assert!(result.contains("Leave a Comment"));
-        assert!(result.contains("action=\"/cgi-bin/comment\""));
+        assert!(result.contains("action=\"/cgi-bin/comment?\""));
         assert!(result.contains("name=\"USER\""));
         assert!(result.contains("name=\"TEXT\""));
     }
@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn test_form_with_query_params() {
         let result = extend("https://example.com/page?param=value", "");
-        assert!(result.contains("action=\"/cgi-bin/comment\""));
+        assert!(result.contains("action=\"/cgi-bin/comment?\""));
     }
 
     #[test]

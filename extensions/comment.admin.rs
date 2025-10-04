@@ -1,7 +1,8 @@
 // comment.admin.rs - Admin panel for comment moderation
 // Handles comment moderation interface and admin panel functionality
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 use std::collections::HashMap;
 
@@ -138,9 +139,25 @@ fn move_comments_to_processing() -> Result<(), String> {
     let in_file = comments_dir.join("in");
     let processing_file = comments_dir.join("processing");
     
-    if !processing_file.exists() && in_file.exists() {
-        fs::rename(&in_file, &processing_file)
-            .map_err(|e| format!("Failed to move comments to processing: {}", e))?;
+    if in_file.exists() {
+        let in_content = fs::read_to_string(&in_file)
+            .map_err(|e| format!("Failed to read in file: {}", e))?;
+        
+        if !in_content.trim().is_empty() {
+            // Append to processing file
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&processing_file)
+                .map_err(|e| format!("Failed to open processing file: {}", e))?;
+            
+            file.write_all(in_content.as_bytes())
+                .map_err(|e| format!("Failed to write to processing file: {}", e))?;
+            
+            // Clear the in file
+            fs::write(&in_file, "")
+                .map_err(|e| format!("Failed to clear in file: {}", e))?;
+        }
     }
     
     Ok(())

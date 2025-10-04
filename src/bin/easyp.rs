@@ -456,7 +456,7 @@ impl OnDemandHttpsServer {
     }
 
     /// Run the server
-    fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Calculate actual ports (including --over-9000 effect)
         let http_port = if self.args.over_9000 {
             self.args.http_port + 9000
@@ -521,8 +521,8 @@ impl OnDemandHttpsServer {
                     let secure_file_server = self.secure_file_server.clone();
                     let extension_registry = self.extension_registry.clone();
 
-                    std::thread::spawn(move || {
-                        if let Err(e) = Self::handle_http_connection(stream, acme_client, http_challenges, secure_file_server, extension_registry) {
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::handle_http_connection(stream, acme_client, http_challenges, secure_file_server, extension_registry).await {
                             eprintln!("HTTP connection error: {}", e);
                         }
                     });
@@ -548,8 +548,8 @@ impl OnDemandHttpsServer {
                     let extension_registry = self.extension_registry.clone();
                     let secure_file_server = self.secure_file_server.clone();
 
-                           std::thread::spawn(move || {
-                        if let Err(e) = Self::handle_connection_static(stream, cert_resolver, args, acme_client, http_challenges, extension_registry, secure_file_server) {
+                           tokio::spawn(async move {
+                        if let Err(e) = Self::handle_connection_static(stream, cert_resolver, args, extension_registry, http_challenges, secure_file_server).await {
                                    eprintln!("HTTPS connection error: {}", e);
                                }
                            });
@@ -575,7 +575,7 @@ impl OnDemandHttpsServer {
     }
 
     /// Handle HTTP connection (port 80) for ACME challenges and file serving
-    fn handle_http_connection(
+    async fn handle_http_connection(
         mut stream: TcpStream,
         acme_client: Option<Arc<AcmeClient>>,
         http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
@@ -632,6 +632,8 @@ impl OnDemandHttpsServer {
             if let Some(path_start) = first_line.find(' ') {
                 if let Some(path_end) = first_line[path_start + 1..].find(' ') {
                     &first_line[path_start + 1..path_start + 1 + path_end]
+
+
                 } else {
                     "/"
                 }
@@ -641,8 +643,6 @@ impl OnDemandHttpsServer {
         } else {
             "/"
         };
-
-        println!("Requested path: {}", request_path);
         println!("DEBUG: Full request: {}", request);
 
         // Check for bin extension requests (CGI-like)
@@ -679,14 +679,15 @@ impl OnDemandHttpsServer {
                     return Ok(());
                 }
                 Err(e) => {
+                    let error_msg = format!("Error: {}", e);
                     let error_response = format!(
                         "HTTP/1.1 500 Internal Server Error\r\n\
                          Content-Type: text/plain\r\n\
                          Content-Length: {}\r\n\
                          \r\n\
-                         Error: {}",
-                        e.len(),
-                        e
+                         {}",
+                        error_msg.len(),
+                        error_msg
                     );
                     stream.write_all(error_response.as_bytes())?;
                     stream.flush()?;
@@ -731,7 +732,8 @@ impl OnDemandHttpsServer {
                 }
                 
                 // Handle admin extension request
-                match extension_registry.lock().unwrap().process_admin_request(admin_path, "GET", query_string, "", &headers) {
+                let admin_response = extension_registry.lock().unwrap().process_admin_request(admin_path, "GET", query_string, &headers);
+                match admin_response {
                     Ok(response) => {
                         stream.write_all(response.as_bytes())?;
                         stream.flush()?;
@@ -755,6 +757,8 @@ impl OnDemandHttpsServer {
             }
         }
 
+        println!("Requested path: {}", request_path);
+
         // Try to serve the requested file using secure file server
         match secure_file_server.serve_file(request_path) {
             Ok(Some(file_content)) => {
@@ -770,14 +774,11 @@ impl OnDemandHttpsServer {
                     
                     // Check if this is HTML content that needs extension processing
                     if let Ok(content_string) = String::from_utf8(file_content.clone()) {
-                        if content_string.contains("#EXTEND:") {
-                            // Process extensions in the HTML content
-                            // Process extensions in the HTML content
-                            #[cfg(feature = "extensions")]
-                            {
-                                let processed_html = extension_registry.lock().unwrap().process_html(&content_string, request_path);
-                                processed_content = processed_html.into_bytes();
-                            }
+                        // Process extensions in the HTML content
+                        #[cfg(feature = "extensions")]
+                        {
+                            let processed_html = extension_registry.lock().unwrap().process_html(&content_string, request_path);
+                            processed_content = processed_html.into_bytes();
                         }
                     }
                     
@@ -891,13 +892,12 @@ impl OnDemandHttpsServer {
     }
 
     /// Handle a single HTTPS connection (static version for threading)
-    fn handle_connection_static(
+    async fn handle_connection_static(
         mut stream: TcpStream,
         cert_resolver: Arc<dyn ResolvesServerCert + Send + Sync>,
         args: Args,
-        acme_client: Option<Arc<AcmeClient>>,
-        http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
         extension_registry: Arc<Mutex<ExtensionRegistry>>,
+        http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
         secure_file_server: SecureFileServer,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut acceptor = Acceptor::default();
@@ -950,7 +950,7 @@ impl OnDemandHttpsServer {
 
         // Handle the connection
         println!("🔍 About to call process_https_request_static for domain: {}", server_name);
-        Self::process_https_request_static(&mut stream, &mut conn, &server_name, &acme_client, &http_challenges, &extension_registry, &secure_file_server)?;
+        Self::process_https_request_static(&mut stream, &mut conn, &server_name, &extension_registry, &http_challenges, &secure_file_server).await?;
         println!("🔍 process_https_request_static completed for domain: {}", server_name);
 
         Ok(())
@@ -962,9 +962,8 @@ impl OnDemandHttpsServer {
         mut stream: TcpStream,
         cert_resolver: Arc<dyn ResolvesServerCert + Send + Sync>,
         args: Args,
-        acme_client: Option<Arc<AcmeClient>>,
-        http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
         extension_registry: Arc<Mutex<ExtensionRegistry>>,
+        http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut acceptor = Acceptor::default();
 
@@ -1015,19 +1014,18 @@ impl OnDemandHttpsServer {
         };
 
         // Handle the connection
-        self.process_https_request(&mut stream, &mut conn, &server_name, &acme_client, &http_challenges, &extension_registry)?;
+        self.process_https_request(&mut stream, &mut conn, &server_name, &extension_registry, &http_challenges)?;
 
         Ok(())
     }
 
     /// Process HTTPS request and send response (static version for threading)
-    fn process_https_request_static(
+    async fn process_https_request_static(
         stream: &mut TcpStream,
         conn: &mut ServerConnection,
         server_name: &str,
-        acme_client: &Option<Arc<AcmeClient>>,
-        http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
         extension_registry: &Arc<Mutex<ExtensionRegistry>>,
+        http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
         secure_file_server: &SecureFileServer,
     ) -> Result<(), Box<dyn std::error::Error>> {
         println!("🔍 process_https_request_static started for domain: {}", server_name);
@@ -1104,7 +1102,7 @@ impl OnDemandHttpsServer {
 
                    // Handle HTTP-01 ACME challenges
                    if first_line.starts_with("GET /.well-known/acme-challenge/") {
-                       return Self::handle_acme_challenge_static(stream, conn, first_line, acme_client, http_challenges);
+                       return Self::handle_acme_challenge_static(stream, conn, first_line, &None, http_challenges);
                    }
         }
 
@@ -1141,14 +1139,11 @@ impl OnDemandHttpsServer {
                     
                     // Check if this is HTML content that needs extension processing
                     if let Ok(content_string) = String::from_utf8(file_content.clone()) {
-                        if content_string.contains("#EXTEND:") {
-                            // Process extensions in the HTML content
-                            // Process extensions in the HTML content
-                            #[cfg(feature = "extensions")]
-                            {
-                                let processed_html = extension_registry.lock().unwrap().process_html(&content_string, request_path);
-                                processed_content = processed_html.into_bytes();
-                            }
+                        // Process extensions in the HTML content
+                        #[cfg(feature = "extensions")]
+                        {
+                            let processed_html = extension_registry.lock().unwrap().process_html(&content_string, request_path);
+                            processed_content = processed_html.into_bytes();
                         }
                     }
                     
@@ -1257,9 +1252,8 @@ impl OnDemandHttpsServer {
         stream: &mut TcpStream,
         conn: &mut ServerConnection,
         server_name: &str,
-        acme_client: &Option<Arc<AcmeClient>>,
-        http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
         extension_registry: &Arc<Mutex<ExtensionRegistry>>,
+        http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Complete the handshake
         conn.complete_io(stream)?;
@@ -1304,10 +1298,8 @@ impl OnDemandHttpsServer {
             
                    // Handle HTTP-01 ACME challenges
                    if first_line.starts_with("GET /.well-known/acme-challenge/") {
-                       return Self::handle_acme_challenge(stream, conn, first_line, acme_client, http_challenges);
+                       return Self::handle_acme_challenge(stream, conn, first_line, &self.acme_client, http_challenges);
                    }
-        }
-
         // Extract the request path from the HTTP request
         let request_path = if let Some(first_line) = lines.first() {
             if let Some(path_start) = first_line.find(' ') {
@@ -1325,7 +1317,9 @@ impl OnDemandHttpsServer {
 
         println!("Requested path: {}", request_path);
 
+        }
         // Try to serve the requested file using secure file server
+        let request_path = "/"; // Default to root path
         match self.secure_file_server.serve_file(request_path) {
             Ok(Some(file_content)) => {
                 // Successfully served a file
@@ -1988,9 +1982,10 @@ fn parse_allowed_ips(ips_str: &str) -> Result<Vec<IpAddr>, Box<dyn std::error::E
     Ok(ips)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 EasyPeas HTTPS Server starting - Debug version with enhanced ACME integration");
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     debug_extensions_enabled();
+    println!("🚀 EasyPeas HTTPS Server starting - Debug version with enhanced ACME integration");
     let args = Args::parse();
 
     // Initialize logging
@@ -2006,7 +2001,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create and run server
     let server = OnDemandHttpsServer::new(args)?;
-    server.run()?;
+    server.run().await?;
 
     Ok(())
 }

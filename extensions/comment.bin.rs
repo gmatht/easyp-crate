@@ -26,10 +26,36 @@ pub fn cgi_main(env: &CgiEnv) -> Result<String, String> {
         .map(|s| url_decode(s))
         .unwrap_or_else(|| "/".to_string());
     
-    // Create the comment entry
+    // Get USER and TEXT parameters
+    let user = params.get("USER")
+        .map(|s| url_decode(s))
+        .unwrap_or_else(|| "Anonymous".to_string());
+    let text = params.get("TEXT")
+        .map(|s| url_decode(s))
+        .unwrap_or_else(|| "".to_string());
+    
+    // Validate required parameters
+    if user.trim().is_empty() || text.trim().is_empty() {
+        return Ok(format!(
+            "HTTP/1.1 400 Bad Request\r\n\
+            Content-Type: text/html\r\n\r\n\
+            <!DOCTYPE html>\n\
+            <html>\n\
+            <head><title>Missing Parameters</title></head>\n\
+            <body>\n\
+            <h1>Missing Required Parameters</h1>\n\
+            <p>Both USER and TEXT parameters are required.</p>\n\
+            <p><a href=\"{}\">Go back</a></p>\n\
+            </body>\n\
+            </html>",
+            return_url
+        ));
+    }
+    
+    // Create the comment entry in the expected format
     let comment_entry = format!(
-        "{}\n",
-        env.request_uri
+        "return_url={}&USER={}&TEXT={}\n",
+        return_url, user, text
     );
     // Limit text to 10K characters
     if comment_entry.len() > 10000 {
