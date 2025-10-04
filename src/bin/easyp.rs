@@ -25,7 +25,9 @@ use rustls::{ServerConfig, ServerConnection};
 use rustls_acme::{AcmeClient, OnDemandCertResolver, DnsValidator};
 use rustls_acme::{AcmeConfig, ChallengeType};
 
-// Import our secure file server module
+// Import our modules
+#[path = "../cgi_env.rs"]
+mod cgi_env;
 #[path = "../modules/secure_file_server_module.rs"]
 mod secure_file_server_module;
 use secure_file_server_module::{SecureFileServer, SecurityConfig};
@@ -264,7 +266,7 @@ impl OnDemandHttpsServer {
                        allowed_ips: allowed_ips.clone(),
                        cache_dir,
                        renewal_threshold_days: 30,
-                       challenge_type: ChallengeType::Http01,
+                       challenge_type: ChallengeType::Http01("".to_string(), "".to_string()),
                        is_staging: true, // Always staging in test mode
                        bogus_domain: args.bogus_domain.clone(),
                    };
@@ -305,7 +307,7 @@ impl OnDemandHttpsServer {
                        allowed_ips: allowed_ips.clone(),
                        cache_dir,
                        renewal_threshold_days: 30,
-                       challenge_type: ChallengeType::Http01,
+                       challenge_type: ChallengeType::Http01("".to_string(), "".to_string()),
                        is_staging: args.staging || args.acme_directory.contains("staging") || args.acme_directory.contains("stg"),
                        bogus_domain: args.bogus_domain.clone(),
                    };
@@ -474,9 +476,10 @@ impl OnDemandHttpsServer {
                     let acme_client = self.acme_client.clone();
                     let http_challenges = self.http_challenges.clone();
                     let secure_file_server = self.secure_file_server.clone();
+                    let extension_registry = self.extension_registry.clone();
 
                     std::thread::spawn(move || {
-                        if let Err(e) = Self::handle_http_connection(stream, acme_client, http_challenges, secure_file_server) {
+                        if let Err(e) = Self::handle_http_connection(stream, acme_client, http_challenges, secure_file_server, extension_registry) {
                             eprintln!("HTTP connection error: {}", e);
                         }
                     });
@@ -534,6 +537,7 @@ impl OnDemandHttpsServer {
         acme_client: Option<Arc<AcmeClient>>,
         http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
         secure_file_server: SecureFileServer,
+        extension_registry: ExtensionRegistry,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Read HTTP request
         let mut buffer = [0; 4096];
@@ -611,9 +615,12 @@ impl OnDemandHttpsServer {
                     if let Ok(content_string) = String::from_utf8(file_content.clone()) {
                         if content_string.contains("#EXTEND:") {
                             // Process extensions in the HTML content
-                            // TODO: Implement extension processing
-                            // let processed_html = extension_registry.process_html(&content_string, request_path);
-                            // processed_content = processed_html.into_bytes();
+                            // Process extensions in the HTML content
+                            #[cfg(feature = "extensions")]
+                            {
+                                let processed_html = extension_registry.process_html(&content_string, request_path);
+                                processed_content = processed_html.into_bytes();
+                            }
                         }
                     }
                     
@@ -979,9 +986,12 @@ impl OnDemandHttpsServer {
                     if let Ok(content_string) = String::from_utf8(file_content.clone()) {
                         if content_string.contains("#EXTEND:") {
                             // Process extensions in the HTML content
-                            // TODO: Implement extension processing
-                            // let processed_html = extension_registry.process_html(&content_string, request_path);
-                            // processed_content = processed_html.into_bytes();
+                            // Process extensions in the HTML content
+                            #[cfg(feature = "extensions")]
+                            {
+                                let processed_html = extension_registry.process_html(&content_string, request_path);
+                                processed_content = processed_html.into_bytes();
+                            }
                         }
                     }
                     
@@ -1141,8 +1151,24 @@ impl OnDemandHttpsServer {
                    }
         }
 
+        // Extract the request path from the HTTP request
+        let request_path = if let Some(first_line) = lines.first() {
+            if let Some(path_start) = first_line.find(' ') {
+                if let Some(path_end) = first_line[path_start + 1..].find(' ') {
+                    &first_line[path_start + 1..path_start + 1 + path_end]
+                } else {
+                    "/"
+                }
+            } else {
+                "/"
+            }
+        } else {
+            "/"
+        };
+
+        println!("Requested path: {}", request_path);
+
         // Try to serve the requested file using secure file server
-        let request_path = "/"; // Default to root path
         match self.secure_file_server.serve_file(request_path) {
             Ok(Some(file_content)) => {
                 // Successfully served a file
