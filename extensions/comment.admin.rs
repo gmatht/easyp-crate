@@ -58,12 +58,14 @@ fn create_live_comments_dir() -> Result<(), String> {
 fn get_comment_md5(comment: &str) -> Result<String, String> {
     // Parse comment to extract return_url
     // Comment format: "/cgi-bin/comment?return_url=URL&USER=NAME&TEXT=COMMENT"
+    // or cleaned format: "return_url=URL&USER=NAME&TEXT=COMMENT"
     
-    // First, extract the query string part after "?"
+    // First, extract the query string part after "?" if it exists
     let query_part = if let Some((_, query)) = comment.split_once('?') {
         query
     } else {
-        return Err("No query parameters found in comment".to_string());
+        // If no '?' found, assume the comment is already in cleaned format
+        comment
     };
     
     let params: std::collections::HashMap<&str, &str> = query_part
@@ -204,14 +206,21 @@ fn accept_comment(comment: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to write to accept file: {}", e))?;
     
     // Append to live comments directory based on MD5 of return_url
-    match get_comment_md5(comment) {
+    match get_comment_md5(clean_comment) {
         Ok(md5_hash) => {
-            eprintln!("DEBUG: Comment: {}", comment);
-            eprintln!("DEBUG: Clean comment: {}", clean_comment);
-            eprintln!("DEBUG: MD5 hash: {}", md5_hash);
+            // Write debug messages to a file
+            let debug_file = Path::new("/tmp/comment_debug.log");
+            let mut debug_handle = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(debug_file)
+                .unwrap_or_else(|_| std::fs::File::create("/tmp/comment_debug_fallback.log").unwrap());
+            writeln!(debug_handle, "DEBUG: Comment: {}", comment).unwrap_or_default();
+            writeln!(debug_handle, "DEBUG: Clean comment: {}", clean_comment).unwrap_or_default();
+            writeln!(debug_handle, "DEBUG: MD5 hash: {}", md5_hash).unwrap_or_default();
             
             let live_file = Path::new("/var/spool/easypeas/comments/live").join(&md5_hash);
-            eprintln!("DEBUG: Live file path: {:?}", live_file);
+            writeln!(debug_handle, "DEBUG: Live file path: {:?}", live_file).unwrap_or_default();
             
             let mut live_file_handle = fs::OpenOptions::new()
                 .create(true)
@@ -222,11 +231,17 @@ fn accept_comment(comment: &str) -> Result<(), String> {
             writeln!(live_file_handle, "{}", clean_comment)
                 .map_err(|e| format!("Failed to write to live file: {}", e))?;
             
-            eprintln!("DEBUG: Successfully wrote to live file");
+            writeln!(debug_handle, "DEBUG: Successfully wrote to live file").unwrap_or_default();
         }
         Err(e) => {
-            eprintln!("DEBUG: Failed to get MD5 hash: {}", e);
-            eprintln!("DEBUG: Comment was: {}", comment);
+            let debug_file = Path::new("/tmp/comment_debug.log");
+            let mut debug_handle = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(debug_file)
+                .unwrap_or_else(|_| std::fs::File::create("/tmp/comment_debug_fallback.log").unwrap());
+            writeln!(debug_handle, "DEBUG: Failed to get MD5 hash: {}", e).unwrap_or_default();
+            writeln!(debug_handle, "DEBUG: Comment was: {}", comment).unwrap_or_default();
         }
     }
     
@@ -283,19 +298,19 @@ fn generate_success_page(accepted_count: usize, rejected_count: usize, admin_key
     html.push_str("<body>\n");
     
     html.push_str("<div class=\"success\">\n");
-    html.push_str("<h1>✅ Comments Processed Successfully!</h1>\n");
+    html.push_str("<h1>[SUCCESS] Comments Processed Successfully!</h1>\n");
     html.push_str("<p>Your moderation actions have been completed.</p>\n");
     html.push_str("</div>\n");
     
     html.push_str("<div class=\"stats\">\n");
-    html.push_str("<h2>📊 Session Statistics</h2>\n");
+    html.push_str("<h2>[STATS] Session Statistics</h2>\n");
     html.push_str(&format!("<p><strong>Comments Accepted:</strong> {}</p>\n", accepted_count));
     html.push_str(&format!("<p><strong>Comments Rejected:</strong> {}</p>\n", rejected_count));
     html.push_str(&format!("<p><strong>Total Processed:</strong> {}</p>\n", accepted_count + rejected_count));
     html.push_str("</div>\n");
     
     // Show last 10 lines of accept file
-    html.push_str("<h2>📝 Recent Accepted Comments</h2>\n");
+    html.push_str("<h2>[ACCEPTED] Recent Accepted Comments</h2>\n");
     match get_last_lines("/var/spool/easypeas/comments/accept", 10) {
         Ok(lines) => {
             if lines.is_empty() {
@@ -315,7 +330,7 @@ fn generate_success_page(accepted_count: usize, rejected_count: usize, admin_key
     }
     
     // Show last 10 lines of reject file
-    html.push_str("<h2>❌ Recent Rejected Comments</h2>\n");
+    html.push_str("<h2>[REJECTED] Recent Rejected Comments</h2>\n");
     match get_last_lines("/var/spool/easypeas/comments/reject", 10) {
         Ok(lines) => {
             if lines.is_empty() {
