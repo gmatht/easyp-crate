@@ -63,3 +63,5 @@ urlencoding = "2.1"
 
 # Regular expressions for extension processing
 regex = "1.10"
+# Directory walking for domain detection
+walkdir = "2.4"

@@ -155,6 +155,10 @@ struct Args {
     /// Challenge type (http01 or dns01)
     #[arg(long, default_value = "http01")]
     challenge_type: String,
+
+    /// Print admin URLs for all domains and admin keys, then exit
+    #[arg(long)]
+    admin_urls: bool,
 }
 
 
@@ -2004,11 +2008,114 @@ fn parse_allowed_ips(ips_str: &str) -> Result<Vec<IpAddr>, Box<dyn std::error::E
     Ok(ips)
 }
 
+/// Get admin keys from the admin_keys file
+fn get_admin_keys() -> Result<std::collections::HashMap<String, String>, Box<dyn std::error::Error>> {
+    let admin_keys_file = std::path::Path::new("/var/lib/easypeas/admin_keys");
+    let mut admin_keys = std::collections::HashMap::new();
+    
+    if admin_keys_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(admin_keys_file) {
+            for line in content.lines() {
+                // Format is: extension_name_key (e.g., comment_71f8732b179e9339)
+                // We need the full key including the underscore
+                if let Some(underscore_pos) = line.find('_') {
+                    let ext_name = &line[..underscore_pos];
+                    let full_key = &line[underscore_pos..]; // Include the underscore in the key
+                    admin_keys.insert(ext_name.to_string(), full_key.to_string());
+                }
+            }
+        }
+    }
+    
+    Ok(admin_keys)
+}
+
+/// Get domains from certificate cache and add localhost
+fn get_domains(cache_dir: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut domains = Vec::new();
+    
+    // Add localhost
+    domains.push("localhost".to_string());
+    
+    // Scan certificate cache directory for domains
+    let cache_path = std::path::Path::new(cache_dir);
+    if cache_path.exists() {
+        // Recursively find all certificate files
+        if let Ok(entries) = walkdir::WalkDir::new(cache_path).into_iter().collect::<Result<Vec<_>, _>>() {
+            for entry in entries {
+                if let Some(file_name) = entry.file_name().to_str() {
+                    // Look for various certificate file patterns
+                    if file_name.ends_with(".crt") || file_name.ends_with(".pem") {
+                        // Extract domain from filename patterns like:
+                        // - ca.dansted.org.crt
+                        // - 1234567890_crt_ca_dansted_org.crt
+                        // - 1234567890_crt_www_dansted_org.crt
+                        let domain = if file_name.contains("_crt_") {
+                            // Pattern: 1234567890_crt_domain_name.crt
+                            if let Some(start) = file_name.find("_crt_") {
+                                let domain_part = &file_name[start + 5..];
+                                let domain_part = domain_part.trim_end_matches(".crt");
+                                // Replace underscores with dots
+                                domain_part.replace("_", ".")
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            // Pattern: domain.com.crt
+                            file_name.trim_end_matches(".crt").trim_end_matches(".pem").to_string()
+                        };
+                        
+                        // Filter out non-domain filenames (like "fullchain", "privkey", etc.)
+                        if !domain.is_empty() 
+                            && !domains.contains(&domain)
+                            && domain.contains(".")
+                            && !domain.starts_with("cached_")
+                            && !domain.starts_with("fullchain")
+                            && !domain.starts_with("privkey")
+                            && !domain.starts_with("acme_") {
+                            domains.push(domain);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(domains)
+}
+
+/// Print admin URLs for all domains and admin keys
+fn print_admin_urls(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let admin_keys = get_admin_keys()?;
+    let domains = get_domains(&args.cache_dir)?;
+    
+    if admin_keys.is_empty() {
+        println!("No admin keys found in /var/lib/easypeas/admin_keys");
+        return Ok(());
+    }
+    
+    println!("Admin URLs:");
+    for domain in domains {
+        for (ext_name, key) in &admin_keys {
+            let admin_url = format!("https://{}/{}{}", domain, ext_name, key);
+            println!("{}", admin_url);
+        }
+    }
+    
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     debug_extensions_enabled();
     println!("🚀 EasyPeas HTTPS Server starting - Debug version with enhanced ACME integration");
     let args = Args::parse();
+
+    // Handle --admin-urls option
+    if args.admin_urls {
+        print_admin_urls(&args)?;
+        return Ok(());
+    }
 
     // Initialize logging
     if args.verbose {
