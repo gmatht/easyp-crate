@@ -60,3 +60,6 @@ libc = "0.2"
 
 # URL encoding
 urlencoding = "2.1"
+
+# Regular expressions for extension processing
+regex = "1.10"

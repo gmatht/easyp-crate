@@ -121,7 +121,43 @@ fn main() -> std::io::Result<()> {
 
     out.push_str("    pub fn process_html(&self, html: &str, url: &str) -> String {\n");
     out.push_str("        // Process HTML with extensions\n");
-    out.push_str("        html.to_string()\n");
+    out.push_str("        let mut result = html.to_string();\n");
+    out.push_str("        \n");
+    
+    // Dynamically generate extension processing for each .expand.rs file
+    let extensions_dir = std::path::Path::new("extensions");
+    if let Ok(entries) = std::fs::read_dir(extensions_dir) {
+        for entry in entries.flatten() {
+            if let Some(file_name) = entry.file_name().to_str() {
+                if file_name.ends_with(".expand.rs") {
+                    let ext_name = file_name.replace(".expand.rs", "");
+                    out.push_str(&format!(
+                        "        // Process #EXTEND:{}() directives\n",
+                        ext_name
+                    ));
+                    out.push_str(&format!(
+                        "        let {}_pattern = regex::Regex::new(r\"#EXTEND:{}\\(([^)]*)\\)\").unwrap();\n",
+                        ext_name, ext_name
+                    ));
+                    out.push_str(&format!(
+                        "        result = {}_pattern.replace_all(&result, |caps: &regex::Captures| {{\n",
+                        ext_name
+                    ));
+                    out.push_str(&format!(
+                        "            let args = &caps[1];\n"
+                    ));
+                    out.push_str(&format!(
+                        "            {}::extend(url, args)\n",
+                        ext_name
+                    ));
+                    out.push_str("        }).to_string();\n");
+                    out.push_str("        \n");
+                }
+            }
+        }
+    }
+    
+    out.push_str("        result\n");
     out.push_str("    }\n\n");
 
     out.push_str("    pub fn is_valid_admin_key(&self, key: &str) -> bool {\n");
@@ -130,15 +166,12 @@ fn main() -> std::io::Result<()> {
 
     out.push_str("    pub fn process_admin_request(&self, path: &str, query: &str, body: &str, headers: &std::collections::HashMap<String, String>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {\n");
     out.push_str("        // Process admin request by checking for admin extensions\n");
-    out.push_str("        println!(\"DEBUG: Processing admin request for path: {}\", path);\n");
-    out.push_str("        println!(\"DEBUG: Available admin keys: {:?}\", self.admin_keys);\n");
     out.push_str("        for (ext_name, key) in &self.admin_keys {\n");
     out.push_str("            let admin_prefix = format!(\"/{}_\", ext_name);\n");
     out.push_str("            println!(\"DEBUG: Checking prefix {} with key {}\", admin_prefix, key);\n");
     out.push_str("            if path.starts_with(&admin_prefix) {\n");
     out.push_str("                match ext_name.as_str() {\n");
     out.push_str("                    \"comment\" => {\n");
-    out.push_str("                        println!(\"DEBUG: Routing to comment admin with key: {}\", key);\n");
     out.push_str("                        return comment_admin::handle_comment_admin_request(path, \"GET\", query, body, headers, &self.admin_keys)\n");
     out.push_str("                            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>);\n");
     out.push_str("                    }\n");
@@ -146,7 +179,6 @@ fn main() -> std::io::Result<()> {
     out.push_str("                }\n");
     out.push_str("            }\n");
     out.push_str("        }\n");
-    out.push_str("        println!(\"DEBUG: No matching admin extension found for path: {}\", path);\n");
     out.push_str("        Ok(r#\"{\\\"error\\\": \\\"Admin path not found\\\"}\"#.to_string())\n");
     out.push_str("    }\n\n");
 
@@ -157,20 +189,8 @@ fn main() -> std::io::Result<()> {
     out.push_str("        if admin_keys_file.exists() {\n");
     out.push_str("            if let Ok(content) = std::fs::read_to_string(admin_keys_file) {\n");
     out.push_str("                for line in content.lines() {\n");
-    out.push_str("                    let line = line.trim();\n");
-    out.push_str("                    if line.is_empty() {\n");
-    out.push_str("                        continue;\n");
-    out.push_str("                    }\n");
-    out.push_str("                    // Handle both formats: 'key=value' and 'key_value'\n");
-    out.push_str("                    if let Some((key, value)) = line.split_once('=') {\n");
+    out.push_str("                    if let Some((key, value)) = line.split_once('_') {\n");
     out.push_str("                        self.admin_keys.insert(key.to_string(), value.to_string());\n");
-    out.push_str("                    } else if line.contains('_') {\n");
-    out.push_str("                        // Handle format like 'comment_8c6cbb89bff8b444'\n");
-    out.push_str("                        if let Some(underscore_pos) = line.find('_') {\n");
-    out.push_str("                            let key = &line[..underscore_pos];\n");
-    out.push_str("                            let value = &line[underscore_pos + 1..];\n");
-    out.push_str("                            self.admin_keys.insert(key.to_string(), value.to_string());\n");
-    out.push_str("                        }\n");
     out.push_str("                    }\n");
     out.push_str("                }\n");
     out.push_str("            }\n");
@@ -197,14 +217,14 @@ fn main() -> std::io::Result<()> {
     out.push_str("            }\n");
     out.push_str("        }\n");
     out.push_str("        \n");
-    out.push_str("                if needs_save {\n");
-        out.push_str("            let admin_keys_file = std::path::Path::new(\"/var/lib/easypeas/admin_keys\");\n");
+    out.push_str("        if needs_save {\n");
+    out.push_str("            let admin_keys_file = std::path::Path::new(\"/var/lib/easypeas/admin_keys\");\n");
     out.push_str("            if let Some(parent) = admin_keys_file.parent() {\n");
     out.push_str("                let _ = std::fs::create_dir_all(parent);\n");
     out.push_str("            }\n");
     out.push_str("            let mut content = String::new();\n");
     out.push_str("            for (k, v) in &self.admin_keys {\n");
-    out.push_str("                content.push_str(&format!(\"{}={}\\n\", k, v));\n");
+    out.push_str("                content.push_str(&format!(\"{}_{}\\n\", k, v));\n");
     out.push_str("            }\n");
     out.push_str("            let _ = std::fs::write(admin_keys_file, content);\n");
     out.push_str("        }\n");

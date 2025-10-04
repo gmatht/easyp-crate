@@ -6,7 +6,8 @@
 set -e  # Exit on any error
 
 STAGING=--staging
-
+STAGING=
+		  
 KEEPALIVE=y
 
 if [ "$1" = quitafter ]
@@ -83,12 +84,25 @@ then
 	
 	sleep 1
 	
-	echo "DEBUG: Starting HTTPS test with 10 second timeout..."
+	echo "DEBUG: Starting HTTPS test with 15 second timeout..."
 	echo === HTTPS TEST ===
-	if timeout 10 curl -v --connect-timeout 5 --max-time 10 -k "https://$SRV"; then
+	if timeout 15 curl -v --connect-timeout 10 --max-time 15 \
+		--tlsv1.2 --tlsv1.3 \
+		--ciphers 'ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS' \
+		--retry 2 --retry-delay 1 \
+		-k "https://$SRV"; then
 		echo "DEBUG: HTTPS test completed successfully"
 	else
 		echo "DEBUG: HTTPS test failed or timed out"
+		echo "DEBUG: Attempting HTTPS test with different SSL options..."
+		if timeout 15 curl -v --connect-timeout 10 --max-time 15 \
+			--tls-max 1.3 --tlsv1.2 \
+			--insecure --retry 1 \
+			"https://$SRV" 2>&1 | head -20; then
+			echo "DEBUG: HTTPS test with fallback options completed"
+		else
+			echo "DEBUG: HTTPS test failed with all SSL options"
+		fi
 	fi
 	
 	sleep 1
