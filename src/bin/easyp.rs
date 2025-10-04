@@ -388,11 +388,28 @@ impl OnDemandHttpsServer {
                        }
                    });
                
-               // Initialize root extensions before dropping privileges
+               // Initialize root extensions and admin system before dropping privileges
                #[cfg(feature = "extensions")]
                {
-                   println!("Initializing root extensions...");
-                   let extension_registry = ExtensionRegistry::new();
+                   println!("Initializing root extensions and admin system...");
+                   let mut extension_registry = ExtensionRegistry::new();
+                   
+                   // Load existing admin keys from file
+                   if let Err(e) = extension_registry.load_existing_admin_keys() {
+                       println!("Warning: Failed to load existing admin keys: {}", e);
+                   }
+                   
+                   // Generate missing admin keys and append to file
+                   if let Err(e) = extension_registry.generate_missing_admin_keys() {
+                       println!("Warning: Failed to generate missing admin keys: {}", e);
+                   }
+                   
+                   // Ensure admin file has correct permissions
+                   if let Err(e) = extension_registry.ensure_admin_file_permissions() {
+                       println!("Warning: Failed to set admin file permissions: {}", e);
+                   }
+                   
+                   // Initialize root extensions
                    if let Err(e) = extension_registry.initialize_root_extensions() {
                        println!("Warning: Failed to initialize root extensions: {}", e);
                    }
@@ -665,6 +682,60 @@ impl OnDemandHttpsServer {
                     stream.write_all(error_response.as_bytes())?;
                     stream.flush()?;
                     return Ok(());
+                }
+            }
+        }
+
+        // Check for admin extension requests
+        #[cfg(feature = "extensions")]
+        {
+            // Check if this looks like an admin request (starts with /comment_, /math_, etc.)
+            if request_path.starts_with("/comment_") || request_path.starts_with("/math_") || request_path.starts_with("/example_") {
+                // Extract query string from the request
+                let query_string = if let Some(query_start) = request_path.find('?') {
+                    &request_path[query_start + 1..]
+                } else {
+                    ""
+                };
+                
+                // Extract the path without query string
+                let admin_path = if let Some(query_start) = request_path.find('?') {
+                    &request_path[..query_start]
+                } else {
+                    request_path
+                };
+                
+                // Parse headers
+                let mut headers = std::collections::HashMap::new();
+                for line in &lines[1..] {
+                    if let Some(colon_pos) = line.find(':') {
+                        let header_name = line[..colon_pos].trim().to_lowercase();
+                        let header_value = line[colon_pos + 1..].trim().to_string();
+                        headers.insert(header_name, header_value);
+                    }
+                }
+                
+                // Handle admin extension request
+                match tokio::runtime::Handle::current().block_on(extension_registry.process_admin_request(admin_path, "GET", query_string, "", &headers)) {
+                    Ok(response) => {
+                        stream.write_all(response.as_bytes())?;
+                        stream.flush()?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let error_response = format!(
+                            "HTTP/1.1 500 Internal Server Error\r\n\
+                             Content-Type: text/plain\r\n\
+                             Content-Length: {}\r\n\
+                             \r\n\
+                             Error: {}",
+                            e.to_string().len(),
+                            e
+                        );
+                        stream.write_all(error_response.as_bytes())?;
+                        stream.flush()?;
+                        return Ok(());
+                    }
                 }
             }
         }
