@@ -707,6 +707,15 @@ impl OnDemandHttpsServer {
             // Check if this looks like an admin request (starts with /comment_, /math_, etc.)
             if request_path.starts_with("/comment_") || request_path.starts_with("/math_") || request_path.starts_with("/example_") {
                 println!("DEBUG: Admin request detected for path: {}", request_path);
+                
+                // Extract HTTP method from the first line
+                let http_method = if let Some(first_line) = lines.first() {
+                    first_line.split_whitespace().next().unwrap_or("GET")
+                } else {
+                    "GET"
+                };
+                println!("DEBUG: HTTP method: {}", http_method);
+                
                 // Extract query string from the request
                 let query_string = if let Some(query_start) = request_path.find('?') {
                     &request_path[query_start + 1..]
@@ -723,16 +732,29 @@ impl OnDemandHttpsServer {
                 
                 // Parse headers
                 let mut headers = std::collections::HashMap::new();
+                let mut body = String::new();
+                let mut in_body = false;
+                
                 for line in &lines[1..] {
-                    if let Some(colon_pos) = line.find(':') {
+                    if in_body {
+                        body.push_str(line);
+                        body.push('\n');
+                    } else if line.is_empty() {
+                        in_body = true; // Empty line indicates start of body
+                    } else if let Some(colon_pos) = line.find(':') {
                         let header_name = line[..colon_pos].trim().to_lowercase();
                         let header_value = line[colon_pos + 1..].trim().to_string();
                         headers.insert(header_name, header_value);
                     }
                 }
                 
+                // Remove trailing newline from body
+                if body.ends_with('\n') {
+                    body.pop();
+                }
+                
                 // Handle admin extension request
-                let admin_response = extension_registry.lock().unwrap().process_admin_request(admin_path, "GET", query_string, &headers);
+                let admin_response = extension_registry.lock().unwrap().process_admin_request(admin_path, http_method, query_string, &body, &headers);
                 match admin_response {
                     Ok(response) => {
                         stream.write_all(response.as_bytes())?;

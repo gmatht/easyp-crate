@@ -164,7 +164,7 @@ fn main() -> std::io::Result<()> {
     out.push_str("        self.admin_keys.values().any(|k| k == key)\n");
     out.push_str("    }\n\n");
 
-    out.push_str("    pub fn process_admin_request(&self, path: &str, query: &str, body: &str, headers: &std::collections::HashMap<String, String>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {\n");
+    out.push_str("    pub fn process_admin_request(&self, path: &str, method: &str, query: &str, body: &str, headers: &std::collections::HashMap<String, String>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {\n");
     out.push_str("        // Process admin request by checking for admin extensions\n");
     out.push_str("        for (ext_name, key) in &self.admin_keys {\n");
     out.push_str("            let admin_prefix = format!(\"/{}_\", ext_name);\n");
@@ -172,7 +172,7 @@ fn main() -> std::io::Result<()> {
     out.push_str("            if path.starts_with(&admin_prefix) {\n");
     out.push_str("                match ext_name.as_str() {\n");
     out.push_str("                    \"comment\" => {\n");
-    out.push_str("                        return comment_admin::handle_comment_admin_request(path, \"GET\", query, body, headers, &self.admin_keys)\n");
+    out.push_str("                        return comment_admin::handle_comment_admin_request(path, method, query, body, headers, &self.admin_keys)\n");
     out.push_str("                            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>);\n");
     out.push_str("                    }\n");
     out.push_str("                    _ => continue,\n");
