@@ -388,6 +388,16 @@ impl OnDemandHttpsServer {
                        }
                    });
                
+               // Initialize root extensions before dropping privileges
+               #[cfg(feature = "extensions")]
+               {
+                   println!("Initializing root extensions...");
+                   let extension_registry = ExtensionRegistry::new();
+                   if let Err(e) = extension_registry.initialize_root_extensions() {
+                       println!("Warning: Failed to initialize root extensions: {}", e);
+                   }
+               }
+               
                // Drop privileges to unprivileged user after binding to privileged ports
                if let Err(e) = secure_file_server.drop_privileges() {
                    println!("Warning: Failed to drop privileges: {}", e);
@@ -608,6 +618,56 @@ impl OnDemandHttpsServer {
         };
 
         println!("Requested path: {}", request_path);
+
+        // Check for bin extension requests (CGI-like)
+        if request_path.starts_with("/cgi-bin/") {
+            // Extract query string from the request
+            let query_string = if let Some(query_start) = request_path.find('?') {
+                &request_path[query_start + 1..]
+            } else {
+                ""
+            };
+            
+            // Extract the path without query string
+            let bin_path = if let Some(query_start) = request_path.find('?') {
+                &request_path[..query_start]
+            } else {
+                request_path
+            };
+            
+            // Parse headers
+            let mut headers = std::collections::HashMap::new();
+            for line in &lines[1..] {
+                if let Some(colon_pos) = line.find(':') {
+                    let header_name = line[..colon_pos].trim().to_lowercase();
+                    let header_value = line[colon_pos + 1..].trim().to_string();
+                    headers.insert(header_name, header_value);
+                }
+            }
+            
+            // Handle bin extension request
+            match extension_registry.handle_bin_request(bin_path, "GET", query_string, &headers) {
+                Ok(response) => {
+                    stream.write_all(response.as_bytes())?;
+                    stream.flush()?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    let error_response = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\n\
+                         Content-Type: text/plain\r\n\
+                         Content-Length: {}\r\n\
+                         \r\n\
+                         Error: {}",
+                        e.len(),
+                        e
+                    );
+                    stream.write_all(error_response.as_bytes())?;
+                    stream.flush()?;
+                    return Ok(());
+                }
+            }
+        }
 
         // Try to serve the requested file using secure file server
         match secure_file_server.serve_file(request_path) {

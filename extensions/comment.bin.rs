@@ -34,7 +34,8 @@ pub fn cgi_main(env: &CgiEnv) -> Result<String, String> {
     // Limit text to 10K characters
     if comment_entry.len() > 10000 {
         return Ok(format!(  
-            "Content-Type: text/html\r\n\r\n\
+            "HTTP/1.1 400 Bad Request\r\n\
+            Content-Type: text/html\r\n\r\n\
             <!DOCTYPE html>\n\
             <html>\n\
             <head><title>Comment Too Long</title></head>\n\
@@ -62,7 +63,8 @@ pub fn cgi_main(env: &CgiEnv) -> Result<String, String> {
     
     if EXISTING_HASHES.lock().unwrap().contains(&new_comment_hash) {
         return Ok(format!(
-            "Content-Type: text/html\r\n\r\n\
+            "HTTP/1.1 409 Conflict\r\n\
+            Content-Type: text/html\r\n\r\n\
             <!DOCTYPE html>\n\
             <html>\n\
             <head><title>Duplicate Comment</title></head>\n\
@@ -90,7 +92,8 @@ pub fn cgi_main(env: &CgiEnv) -> Result<String, String> {
     EXISTING_HASHES.lock().unwrap().insert(new_comment_hash);
     // Return success response
     Ok(format!(
-        "Content-Type: text/html\r\n\r\n\
+        "HTTP/1.1 200 OK\r\n\
+        Content-Type: text/html\r\n\r\n\
         <!DOCTYPE html>\n\
         <html>\n\
         <head><title>Comment Submitted</title></head>\n\
