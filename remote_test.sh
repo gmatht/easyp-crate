@@ -6,7 +6,7 @@
 set -e  # Exit on any error
 
 STAGING=--staging
-STAGING=
+#STAGING=
 		  
 KEEPALIVE=y
 
@@ -30,7 +30,7 @@ source ~/.cargo/env
 
 # Build if needed
 [ -f target/debug/easyp ] || RUSTC_WRAPPER= cargo build --bin easyp
-if [ -z "$(find examples/src/ acme-lib/src/ -type f -newer target/debug/easyp 2>/dev/null)" ] || RUSTC_WRAPPER= cargo build --bin easyp
+if [ -z "$(find examples/src/ ../acme-lib/src/ ../rustls/src ../rustls-acme/src -type f -newer target/debug/easyp 2>/dev/null)" ] || RUSTC_WRAPPER= cargo build --bin easyp
 then
 	echo "DEBUG: Building completed, starting deployment..."
 	
@@ -79,7 +79,8 @@ then
 	if timeout 10 curl -v --connect-timeout 5 --max-time 10 "http://$SRV"; then
 		echo "DEBUG: HTTP test completed successfully"
 	else
-		echo "DEBUG: HTTP test failed or timed out"
+		echo "ERROR: HTTP test failed or timed out"
+		exit 1
 	fi
 	
 	sleep 1
@@ -93,7 +94,7 @@ then
 		-k "https://$SRV"; then
 		echo "DEBUG: HTTPS test completed successfully"
 	else
-		echo "DEBUG: HTTPS test failed or timed out"
+		echo "ERROR: HTTPS test failed or timed out"
 		echo "DEBUG: Attempting HTTPS test with different SSL options..."
 		if timeout 15 curl -v --connect-timeout 10 --max-time 15 \
 			--tls-max 1.3 --tlsv1.2 \
@@ -101,7 +102,8 @@ then
 			"https://$SRV" 2>&1 | head -20; then
 			echo "DEBUG: HTTPS test with fallback options completed"
 		else
-			echo "DEBUG: HTTPS test failed with all SSL options"
+			echo "ERROR: HTTPS test failed with all SSL options"
+			exit 1
 		fi
 	fi
 	
@@ -114,5 +116,6 @@ then
 		echo "DEBUG: Stopping server process on remote server..."
 	fi
 	
-	echo "DEBUG: Test script completed"
+	echo "DEBUG: Test script completed successfully"
+	exit 0
 fi
