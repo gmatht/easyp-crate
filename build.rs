@@ -136,21 +136,31 @@ fn main() -> std::io::Result<()> {
                         ext_name
                     ));
                     out.push_str(&format!(
-                        "        let {}_pattern = regex::Regex::new(r\"#EXTEND:{}\\(([^)]*)\\)\").unwrap();\n",
-                        ext_name, ext_name
-                    ));
-                    out.push_str(&format!(
-                        "        result = {}_pattern.replace_all(&result, |caps: &regex::Captures| {{\n",
+                        "        // Process #EXTEND:{}() directives using simple string operations\n",
                         ext_name
                     ));
                     out.push_str(&format!(
-                        "            let args = &caps[1];\n"
-                    ));
-                    out.push_str(&format!(
-                        "            {}::extend(url, args)\n",
+                        "        while let Some(start) = result.find(\"#EXTEND:{}(\") {{\n",
                         ext_name
                     ));
-                    out.push_str("        }).to_string();\n");
+                    out.push_str(&format!(
+                        "            let end = result[start..].find(')').unwrap_or(0) + start + 1;\n"
+                    ));
+                    out.push_str(&format!(
+                        "            let args_start = start + \"#EXTEND:{}(\".len();\n",
+                        ext_name
+                    ));
+                    out.push_str(&format!(
+                        "            let args = &result[args_start..end-1];\n"
+                    ));
+                    out.push_str(&format!(
+                        "            let replacement = {}::extend(url, args);\n",
+                        ext_name
+                    ));
+                    out.push_str(&format!(
+                        "            result.replace_range(start..end, &replacement);\n"
+                    ));
+                    out.push_str("        }\n");
                     out.push_str("        \n");
                 }
             }

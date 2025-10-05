@@ -99,10 +99,12 @@ then
 		if timeout 15 curl -v --connect-timeout 10 --max-time 15 \
 			--tls-max 1.3 --tlsv1.2 \
 			--insecure --retry 1 \
-			"https://$SRV" 2>&1 | head -20; then
+			"https://$SRV" > /tmp/curl_output.log 2>&1; then
 			echo "DEBUG: HTTPS test with fallback options completed"
 		else
 			echo "ERROR: HTTPS test failed with all SSL options"
+			echo "DEBUG: Curl output:"
+			cat /tmp/curl_output.log
 			exit 1
 		fi
 	fi

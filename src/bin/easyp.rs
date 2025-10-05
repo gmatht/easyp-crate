@@ -10,16 +10,34 @@
 //! Usage:
 //!   cargo run --example easyp --features acme -- --help
 
-use std::collections::{HashMap, BTreeMap};
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use clap::Parser;
+use lexopt::prelude::*;
 use rustls::server::{Acceptor, ResolvesServerCert};
 use rustls::{ServerConfig, ServerConnection};
+
+// Simple logger without regex dependency
+struct SimpleLogger;
+
+impl log::Log for SimpleLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            println!("{}: {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
 
 #[cfg(feature = "acme")]
 use rustls_acme::{AcmeClient, OnDemandCertResolver, DnsValidator};
@@ -71,101 +89,186 @@ impl ExtensionRegistry {
     }
 }
 
-/// EasyPeas - On-demand HTTPS server with ACME certificate management
-#[derive(Parser, Clone)]
-#[command(name = "easyp")]
-#[command(about = "EasyPeas - On-demand HTTPS server with ACME certificate management")]
-#[command(version)]
+#[derive(Clone)]
 struct Args {
-    /// Domains to serve (e.g., example.com, *.example.com)
     domains: Vec<String>,
-    
-    /// HTTP port (default: 80)
-    #[arg(long, default_value = "80")]
     http_port: u16,
-    
-    /// HTTPS port (default: 443)
-    #[arg(long, default_value = "443")]
     https_port: u16,
-    
-    /// Email for ACME certificate registration (defaults to webmaster@domain for each domain)
-    #[arg(long)]
     email: Option<String>,
-    
-    /// Use Let's Encrypt staging environment
-    #[arg(long)]
     staging: bool,
-    
-    /// Add 9000 to default port numbers (HTTP: 9080, HTTPS: 9443)
-    #[arg(long)]
     over_9000: bool,
-    
-    /// Test client binary to run when server is ready
-    #[arg(long)]
     test_client: Option<String>,
-    
-    /// Test root directory for integration tests
-    #[arg(long, default_value = "test_root")]
     test_root: String,
-    
-    /// Document root directory (default: /var/www/html)
-    #[arg(long, default_value = "/var/www/html")]
     root: String,
-    
-    /// Allowed IP addresses for on-demand certificate requests (comma-separated). If not specified, will auto-detect server IPs
-    #[arg(long)]
     allowed_ips: Option<String>,
-    
-    /// Cache directory for ACME certificates (default: /var/lib/easypeas/certs)
-    #[arg(long, default_value = "/var/lib/easypeas/certs")]
     cache_dir: String,
-
-    /// Enable verbose logging
-    #[arg(short, long)]
     verbose: bool,
-
-    /// Test mode (use self-signed certificates)
-    #[arg(long)]
     test_mode: bool,
-
-    /// Restore ACME certificates from backup before starting
-    #[arg(long)]
     restore_backup: bool,
-
-    /// Bogus domain to use for ACME requests (workaround for rate limits)
-    #[arg(long)]
     bogus_domain: Option<String>,
-
-    // Legacy compatibility arguments
-    /// Port to listen on (legacy, use --https-port instead)
-    #[arg(short, long, default_value = "443")]
     port: u16,
-
-    /// ACME directory URL (legacy, use --staging instead)
-
-
-
-    #[arg(long, default_value = "https://acme-v02.api.letsencrypt.org/directory")]
     acme_directory: String,
-
-    /// Email address for ACME account (legacy, use --email instead)
-    #[arg(long)]
     acme_email: Option<String>,
-
-    /// Challenge type (http01 or dns01)
-    #[arg(long, default_value = "http01")]
     challenge_type: String,
-
-    /// Print admin URLs for all domains and admin keys, then exit
-    #[arg(long)]
     admin_urls: bool,
+}
+
+impl Args {
+    fn parse() -> Result<Self, Box<dyn std::error::Error>> {
+        let mut domains = Vec::new();
+        let mut http_port = 80;
+        let mut https_port = 443;
+        let mut email = None;
+        let mut staging = false;
+        let mut over_9000 = false;
+        let mut test_client = None;
+        let mut test_root = "test_root".to_string();
+        let mut root = "/var/www/html".to_string();
+        let mut allowed_ips = None;
+        let mut cache_dir = "/var/lib/easypeas/certs".to_string();
+        let mut verbose = false;
+        let mut test_mode = false;
+        let mut restore_backup = false;
+        let mut bogus_domain = None;
+        let mut port = 443;
+        let mut acme_directory = "https://acme-v02.api.letsencrypt.org/directory".to_string();
+        let mut acme_email = None;
+        let mut challenge_type = "http01".to_string();
+        let mut admin_urls = false;
+
+        let mut parser = lexopt::Parser::from_env();
+        while let Some(arg) = parser.next()? {
+            match arg {
+                Value(val) => {
+                    domains.push(val.to_string_lossy().to_string());
+                }
+                Short('p') | Long("port") => {
+                    port = parser.value()?.parse()?;
+                }
+                Long("http-port") => {
+                    http_port = parser.value()?.parse()?;
+                }
+                Long("https-port") => {
+                    https_port = parser.value()?.parse()?;
+                }
+                Long("email") => {
+                    email = Some(parser.value()?.to_string_lossy().to_string());
+                }
+                Long("staging") => {
+                    staging = true;
+                }
+                Long("over-9000") => {
+                    over_9000 = true;
+                }
+                Long("test-client") => {
+                    test_client = Some(parser.value()?.to_string_lossy().to_string());
+                }
+                Long("test-root") => {
+                    test_root = parser.value()?.to_string_lossy().to_string();
+                }
+                Long("root") => {
+                    root = parser.value()?.to_string_lossy().to_string();
+                }
+                Long("allowed-ips") => {
+                    allowed_ips = Some(parser.value()?.to_string_lossy().to_string());
+                }
+                Long("cache-dir") => {
+                    cache_dir = parser.value()?.to_string_lossy().to_string();
+                }
+                Short('v') | Long("verbose") => {
+                    verbose = true;
+                }
+                Long("test-mode") => {
+                    test_mode = true;
+                }
+                Long("restore-backup") => {
+                    restore_backup = true;
+                }
+                Long("bogus-domain") => {
+                    bogus_domain = Some(parser.value()?.to_string_lossy().to_string());
+                }
+                Long("acme-directory") => {
+                    acme_directory = parser.value()?.to_string_lossy().to_string();
+                }
+                Long("acme-email") => {
+                    acme_email = Some(parser.value()?.to_string_lossy().to_string());
+                }
+                Long("challenge-type") => {
+                    challenge_type = parser.value()?.to_string_lossy().to_string();
+                }
+                Long("admin-urls") => {
+                    admin_urls = true;
+                }
+                Long("help") => {
+                    println!("EasyPeas - On-demand HTTPS server with ACME certificate management");
+                    println!();
+                    println!("USAGE:");
+                    println!("    easyp [OPTIONS] [DOMAINS]...");
+                    println!();
+                    println!("ARGS:");
+                    println!("    [DOMAINS]...    Optional domains to serve (e.g., example.com, *.example.com)");
+                    println!("                   If not specified, domains will be discovered on-demand from certificate requests");
+                    println!();
+                    println!("OPTIONS:");
+                    println!("    -p, --port <PORT>                    Port to listen on (legacy, use --https-port instead) [default: 443]");
+                    println!("        --http-port <PORT>               HTTP port [default: 80]");
+                    println!("        --https-port <PORT>              HTTPS port [default: 443]");
+                    println!("        --email <EMAIL>                  Email for ACME certificate registration");
+                    println!("        --staging                         Use Let's Encrypt staging environment");
+                    println!("        --over-9000                       Add 9000 to default port numbers (HTTP: 9080, HTTPS: 9443)");
+                    println!("        --test-client <CLIENT>            Test client binary to run when server is ready");
+                    println!("        --test-root <ROOT>                Test root directory for integration tests [default: test_root]");
+                    println!("        --root <ROOT>                     Document root directory [default: /var/www/html]");
+                    println!("        --allowed-ips <IPS>               Allowed IP addresses for on-demand certificate requests (comma-separated)");
+                    println!("        --cache-dir <DIR>                 Cache directory for ACME certificates [default: /var/lib/easypeas/certs]");
+                    println!("    -v, --verbose                        Enable verbose logging");
+                    println!("        --test-mode                       Test mode (use self-signed certificates)");
+                    println!("        --restore-backup                  Restore ACME certificates from backup before starting");
+                    println!("        --bogus-domain <DOMAIN>           Bogus domain to use for ACME requests (workaround for rate limits)");
+                    println!("        --acme-directory <URL>            ACME directory URL (legacy, use --staging instead) [default: https://acme-v02.api.letsencrypt.org/directory]");
+                    println!("        --acme-email <EMAIL>              Email address for ACME account (legacy, use --email instead)");
+                    println!("        --challenge-type <TYPE>           Challenge type (http01 or dns01) [default: http01]");
+                    println!("        --admin-urls                      Print admin URLs for all domains and admin keys, then exit");
+                    println!("        --help                            Print help information");
+                    std::process::exit(0);
+                }
+                _ => return Err(format!("unexpected argument: {:?}", arg).into()),
+            }
+        }
+
+        // Domains are optional for on-demand HTTPS server
+        // The server can discover domains dynamically from certificate requests
+
+        Ok(Args {
+            domains,
+            http_port,
+            https_port,
+            email,
+            staging,
+            over_9000,
+            test_client,
+            test_root,
+            root,
+            allowed_ips,
+            cache_dir,
+            verbose,
+            test_mode,
+            restore_backup,
+            bogus_domain,
+            port,
+            acme_directory,
+            acme_email,
+            challenge_type,
+            admin_urls,
+        })
+    }
 }
 
 
 /// On-demand HTTPS server
 struct OnDemandHttpsServer {
-    http_listener: TcpListener,  // Port 80 for ACME challenges
-    https_listener: TcpListener, // Port 443 for HTTPS traffic
+    http_listener: tokio::net::TcpListener,  // Port 80 for ACME challenges
+    https_listener: tokio::net::TcpListener, // Port 443 for HTTPS traffic
     cert_resolver: Arc<dyn ResolvesServerCert + Send + Sync>,
     args: Args,
     http_challenges: Arc<Mutex<BTreeMap<String, String>>>, // token -> key_authorization
@@ -177,7 +280,7 @@ struct OnDemandHttpsServer {
 
 impl OnDemandHttpsServer {
     /// Create a new on-demand HTTPS server
-    fn new(args: Args) -> Result<Self, Box<dyn std::error::Error>> {
+    async fn new(args: Args) -> Result<Self, Box<dyn std::error::Error>> {
         // Apply --over-9000 option to port numbers
         let http_port = if args.over_9000 {
             args.http_port + 9000
@@ -199,12 +302,10 @@ impl OnDemandHttpsServer {
         };
 
         // Create HTTP listener on specified port for ACME challenges
-        let http_listener = TcpListener::bind(format!("0.0.0.0:{}", http_port))?;
-        http_listener.set_nonblocking(true)?;
+        let http_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", http_port)).await?;
         
         // Create HTTPS listener on specified port for HTTPS traffic
-        let https_listener = TcpListener::bind(format!("0.0.0.0:{}", final_https_port))?;
-        https_listener.set_nonblocking(true)?;
+        let https_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", final_https_port)).await?;
 
         // Look up www-data UID/GID dynamically
         let (www_data_uid, www_data_gid) = get_www_data_uid_gid()?;
@@ -381,16 +482,7 @@ impl OnDemandHttpsServer {
                    return Err(format!("ACME cache directory setup failed: {}", e).into());
                }
                
-               // Initialize domain request logger
-               let mut domain_logger = DomainRequestLogger::new(&args.cache_dir)
-                   .unwrap_or_else(|e| {
-                       println!("Warning: Failed to initialize domain logger: {}", e);
-                       // Create a dummy logger that does nothing
-                       DomainRequestLogger {
-                           log_file: std::path::PathBuf::new(),
-                           requests: Vec::new(),
-                       }
-                   });
+               // Domain request logger removed - was unused dead code
                
                 // Initialize root extensions and admin system before dropping privileges
                 #[cfg(feature = "extensions")]
@@ -446,12 +538,20 @@ impl OnDemandHttpsServer {
                }
 
 
+               // Use shared challenge storage from ACME client instead of separate storage
+               let http_challenges = if let Some(ref acme_client) = acme_client {
+                   // Convert the ACME client's challenge storage to the format expected by HTTP server
+                   Arc::new(Mutex::new(BTreeMap::new())) // We'll access challenges directly from ACME client
+               } else {
+                   Arc::new(Mutex::new(BTreeMap::new()))
+               };
+
                Ok(Self {
                    http_listener,
                    https_listener,
                    cert_resolver,
                    args,
-                   http_challenges: Arc::new(Mutex::new(BTreeMap::new())),
+                   http_challenges,
                    acme_client,
                    allowed_ips,
                    extension_registry,
@@ -513,57 +613,78 @@ impl OnDemandHttpsServer {
 
         let mut connections: Vec<ServerConnection> = Vec::new();
 
+        println!("🔍 Starting async server loop");
+
+        // No more polling! The ACME client and HTTP server now share the same challenge storage
+        // Challenges are automatically available to the HTTP server when created by the ACME client
+
+        println!("🔍 Starting main server loop - listening on HTTP port {} and HTTPS port {}", http_port, final_https_port);
         loop {
-            // Accept HTTP connections (port 80) for ACME challenges
-            match self.http_listener.accept() {
-                Ok((stream, addr)) => {
-                    println!("New HTTP connection from {} (ACME challenge)", addr);
-                    
-                    // Handle HTTP connection for ACME challenges and file serving
-                    let acme_client = self.acme_client.clone();
-                    let http_challenges = self.http_challenges.clone();
-                    let secure_file_server = self.secure_file_server.clone();
-                    let extension_registry = self.extension_registry.clone();
+            println!("🔍 Waiting for connections...");
+            println!("🔍 About to call tokio::select!");
+            tokio::select! {
+                // Accept HTTP connections (port 80) for ACME challenges
+                result = self.http_listener.accept() => {
+                    match result {
+                        Ok((stream, addr)) => {
+                            println!("🔍 New HTTP connection from {} (ACME challenge)", addr);
+                            
+                            // Handle HTTP connection for ACME challenges and file serving
+                            let acme_client = self.acme_client.clone();
+                            let http_challenges = self.http_challenges.clone();
+                            let secure_file_server = self.secure_file_server.clone();
+                            let extension_registry = self.extension_registry.clone();
 
-                    tokio::spawn(async move {
-                        if let Err(e) = Self::handle_http_connection(stream, acme_client, http_challenges, secure_file_server, extension_registry).await {
-                            eprintln!("HTTP connection error: {}", e);
-                        }
+                    tokio::task::spawn_blocking(move || {
+                        let rt = tokio::runtime::Handle::current();
+                        rt.block_on(async {
+                            match Self::handle_http_connection(stream, acme_client, http_challenges, secure_file_server, extension_registry).await {
+                                Ok(()) => {},
+                                Err(e) => {
+                                    let error_msg = format!("{}", e);
+                                    eprintln!("HTTP connection error: {}", error_msg);
+                                }
+                            }
+                        })
                     });
+                        }
+                        Err(e) => {
+                            eprintln!("❌ HTTP accept error: {}", e);
+                        }
+                    }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No connection available, continue
-                }
-                Err(e) => {
-                    eprintln!("HTTP accept error: {}", e);
-                }
-            }
 
-            // Accept HTTPS connections (port 443) for HTTPS traffic
-            match self.https_listener.accept() {
-                Ok((stream, addr)) => {
-                    println!("New HTTPS connection from {}", addr);
-                    
-                    // Handle HTTPS connection
-                    let cert_resolver = self.cert_resolver.clone();
-                    let args = self.args.clone();
-                    let acme_client = self.acme_client.clone();
-                    let http_challenges = self.http_challenges.clone();
-                    let extension_registry = self.extension_registry.clone();
-                    let secure_file_server = self.secure_file_server.clone();
+                // Accept HTTPS connections (port 443) for HTTPS traffic
+                result = self.https_listener.accept() => {
+                    println!("🔍 HTTPS accept() returned: {:?}", result);
+                    match result {
+                        Ok((stream, addr)) => {
+                            println!("🔍 New HTTPS connection from {}", addr);
+                            
+                            // Handle HTTPS connection
+                            let cert_resolver = self.cert_resolver.clone();
+                            let args = self.args.clone();
+                            let acme_client = self.acme_client.clone();
+                            let http_challenges = self.http_challenges.clone();
+                            let extension_registry = self.extension_registry.clone();
+                            let secure_file_server = self.secure_file_server.clone();
 
-                           tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection_static(stream, cert_resolver, args, extension_registry, http_challenges, secure_file_server).await {
-                                   eprintln!("HTTPS connection error: {}", e);
-                               }
-                           });
+                            tokio::spawn(async move {
+                                if let Err(e) = Self::handle_connection_static(stream, cert_resolver, args, extension_registry, http_challenges, secure_file_server).await {
+                                    eprintln!("HTTPS connection error: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("❌ HTTPS accept error: {}", e);
+                        }
+                    }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No connection available, continue
-                }
-                Err(e) => {
-                    eprintln!("HTTPS accept error: {}", e);
-                }
+                
+              // Timeout to prevent busy waiting
+              _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                  // Just continue the loop
+              }
             }
 
             // Process existing connections
@@ -580,19 +701,19 @@ impl OnDemandHttpsServer {
 
     /// Handle HTTP connection (port 80) for ACME challenges and file serving
     async fn handle_http_connection(
-        mut stream: TcpStream,
+        mut stream: tokio::net::TcpStream,
         acme_client: Option<Arc<AcmeClient>>,
         http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
         secure_file_server: SecureFileServer,
         extension_registry: Arc<Mutex<ExtensionRegistry>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Read HTTP request
         let mut buffer = [0; 4096];
         let mut total_read = 0;
 
         // Read data in a loop to handle partial reads
         loop {
-            match stream.read(&mut buffer[total_read..]) {
+            match stream.read(&mut buffer[total_read..]).await {
                 Ok(0) => break, // Connection closed
                 Ok(n) => {
                     total_read += n;
@@ -627,7 +748,7 @@ impl OnDemandHttpsServer {
 
             // Handle HTTP-01 ACME challenges
             if first_line.starts_with("GET /.well-known/acme-challenge/") {
-                return Self::handle_acme_challenge_http(stream, first_line, &acme_client, &http_challenges);
+                return Self::handle_acme_challenge_http(stream, first_line, &acme_client, &http_challenges).await;
             }
         }
 
@@ -676,10 +797,15 @@ impl OnDemandHttpsServer {
             }
             
             // Handle bin extension request
-            match extension_registry.lock().unwrap().handle_bin_request(bin_path, "GET", query_string, &headers) {
+            let response = {
+                let registry = extension_registry.lock().unwrap();
+                registry.handle_bin_request(bin_path, "GET", query_string, &headers)
+            };
+            
+            match response {
                 Ok(response) => {
-                    stream.write_all(response.as_bytes())?;
-                    stream.flush()?;
+                    stream.write_all(response.as_bytes()).await?;
+                    stream.flush().await?;
                     return Ok(());
                 }
                 Err(e) => {
@@ -693,8 +819,8 @@ impl OnDemandHttpsServer {
                         error_msg.len(),
                         error_msg
                     );
-                    stream.write_all(error_response.as_bytes())?;
-                    stream.flush()?;
+                    stream.write_all(error_response.as_bytes()).await?;
+                    stream.flush().await?;
                     return Ok(());
                 }
             }
@@ -761,8 +887,8 @@ impl OnDemandHttpsServer {
                 let admin_response = extension_registry.lock().unwrap().process_admin_request(admin_path, http_method, query_string, &body, &headers);
                 match admin_response {
                     Ok(response) => {
-                        stream.write_all(response.as_bytes())?;
-                        stream.flush()?;
+                        stream.write_all(response.as_bytes()).await?;
+                        stream.flush().await?;
                         return Ok(());
                     }
                     Err(e) => {
@@ -775,8 +901,8 @@ impl OnDemandHttpsServer {
                             e.to_string().len(),
                             e
                         );
-                        stream.write_all(error_response.as_bytes())?;
-                        stream.flush()?;
+                        stream.write_all(error_response.as_bytes()).await?;
+                        stream.flush().await?;
                         return Ok(());
                     }
                 }
@@ -786,14 +912,15 @@ impl OnDemandHttpsServer {
         println!("Requested path: {}", request_path);
 
         // Try to serve the requested file using secure file server
-        match secure_file_server.serve_file(request_path) {
+        let serve_result = secure_file_server.serve_file(request_path);
+        match serve_result {
             Ok(Some(file_content)) => {
                 // Check if this is a redirect response (starts with "HTTP/1.1 301")
                 let content_str = String::from_utf8_lossy(&file_content);
                 if content_str.starts_with("HTTP/1.1 301") {
                     // This is a redirect response, send it directly
-                    stream.write_all(&file_content)?;
-                    stream.flush()?;
+                    stream.write_all(&file_content).await?;
+                    stream.flush().await?;
                 } else {
                     // This is regular file content, process extensions if it's HTML
                     let mut processed_content = file_content.clone();
@@ -848,8 +975,8 @@ impl OnDemandHttpsServer {
                     let mut response = response_headers;
                     response.push_str(&String::from_utf8_lossy(&processed_content));
 
-                    stream.write_all(response.as_bytes())?;
-                    stream.flush()?;
+                    stream.write_all(response.as_bytes()).await?;
+                    stream.flush().await?;
                 }
             }
             Ok(None) => {
@@ -868,8 +995,8 @@ impl OnDemandHttpsServer {
                         default_page
                     );
 
-                    stream.write_all(response.as_bytes())?;
-                    stream.flush()?;
+                    stream.write_all(response.as_bytes()).await?;
+                    stream.flush().await?;
                 } else {
                     // File not found, send 404 for non-root requests
         let response = "HTTP/1.1 404 Not Found\r\n\
@@ -878,13 +1005,14 @@ impl OnDemandHttpsServer {
                        Connection: close\r\n\
                        \r\n\
                        Not Found";
-        stream.write_all(response.as_bytes())?;
-        stream.flush()?;
+        stream.write_all(response.as_bytes()).await?;
+        stream.flush().await?;
                 }
             }
             Err(e) => {
                 // Security error or other error - check if this is a root request first
-                println!("Request denied for {}: {}", request_path, e);
+                let error_msg = format!("{}", e);
+                println!("Request denied for {}: {}", request_path, error_msg);
                 if secure_file_server.is_root_request(request_path) {
                     // Serve default informational page even for security errors on root
                     let default_page = secure_file_server.generate_default_page("localhost");
@@ -898,8 +1026,8 @@ impl OnDemandHttpsServer {
                         default_page.len(),
                         default_page
                     );
-                    stream.write_all(response.as_bytes())?;
-                    stream.flush()?;
+                    stream.write_all(response.as_bytes()).await?;
+                    stream.flush().await?;
                 } else {
                     // Send 404 for non-root requests with security errors
                     let response = "HTTP/1.1 404 Not Found\r\n\
@@ -908,8 +1036,8 @@ impl OnDemandHttpsServer {
                                    Connection: close\r\n\
                                    \r\n\
                                    Not Found";
-                    stream.write_all(response.as_bytes())?;
-                    stream.flush()?;
+                    stream.write_all(response.as_bytes()).await?;
+                    stream.flush().await?;
                 }
             }
         }
@@ -919,25 +1047,83 @@ impl OnDemandHttpsServer {
 
     /// Handle a single HTTPS connection (static version for threading)
     async fn handle_connection_static(
-        mut stream: TcpStream,
+        stream: tokio::net::TcpStream,
         cert_resolver: Arc<dyn ResolvesServerCert + Send + Sync>,
         args: Args,
         extension_registry: Arc<Mutex<ExtensionRegistry>>,
         http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
         secure_file_server: SecureFileServer,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        println!("🔍 Starting HTTPS connection handling");
+        
+        // Convert tokio::net::TcpStream to std::net::TcpStream for rustls
+        let std_stream = stream.into_std()?;
+        
+        // Run the TLS handshake in a blocking context
+        let result = tokio::task::spawn_blocking(move || {
+            Self::handle_https_connection_blocking(
+                std_stream,
+                cert_resolver,
+                args,
+                extension_registry,
+                http_challenges,
+                secure_file_server,
+            )
+        }).await??;
+        
+        Ok(result)
+    }
+
+    /// Handle HTTPS connection in blocking context (for rustls compatibility)
+    fn handle_https_connection_blocking(
+        mut stream: std::net::TcpStream,
+        cert_resolver: Arc<dyn ResolvesServerCert + Send + Sync>,
+        args: Args,
+        extension_registry: Arc<Mutex<ExtensionRegistry>>,
+        http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
+        secure_file_server: SecureFileServer,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        println!("🔍 Starting blocking HTTPS connection handling");
+        
+        // Create server config with our certificate resolver
+        let server_config = ServerConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into()
+        )
+        .with_no_client_auth()
+        .with_cert_resolver(cert_resolver)
+        .map_err(|e| {
+            println!("❌ Failed to create server config: {}", e);
+            format!("Failed to create server config: {}", e)
+        })?;
+
+        println!("✅ Server config created successfully");
+
+        // Create a new acceptor for this connection
+        println!("🔍 Creating new Acceptor for HTTPS connection");
         let mut acceptor = Acceptor::default();
+        
+        println!("🔍 Acceptor created, starting TLS handshake...");
 
         // Read TLS packets until we have a complete ClientHello
         let accepted = loop {
             match acceptor.read_tls(&mut stream) {
-                Ok(0) => return Ok(()), // Connection closed
-                Ok(_) => {
-                    match acceptor.accept() {
-                        Ok(Some(accepted)) => break accepted,
-                        Ok(None) => continue,
+                Ok(0) => {
+                    println!("🔍 Connection closed by client");
+                    return Ok(()); // Connection closed
+                }
+                        Ok(_) => {
+                            match acceptor.accept() {
+                        Ok(Some(accepted)) => {
+                            println!("✅ ClientHello accepted");
+                            break accepted;
+                        }
+                        Ok(None) => {
+                            println!("🔍 Waiting for more data...");
+                            continue;
+                        }
                         Err((e, mut alert)) => {
-                            alert.write_all(&mut stream)?;
+                            println!("❌ Error accepting connection: {}", e);
+                            let _ = alert.write_all(&mut stream);
                             return Err(format!("Error accepting connection: {}", e).into());
                         }
                     }
@@ -946,7 +1132,14 @@ impl OnDemandHttpsServer {
                     // No data available, continue
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    println!("🔍 Client disconnected unexpectedly");
+                    return Ok(());
+                }
+                Err(e) => {
+                    println!("❌ Error reading TLS: {}", e);
+                    return Err(e.into());
+                }
             }
         };
 
@@ -955,110 +1148,46 @@ impl OnDemandHttpsServer {
             .map(|name| name.as_ref().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        println!("Processing request for domain: {}", server_name);
-
-        // Create server config with our certificate resolver
-        let server_config = ServerConfig::builder_with_provider(
-            rustls::crypto::aws_lc_rs::default_provider().into()
-        )
-        .with_no_client_auth()
-        .with_cert_resolver(cert_resolver)
-        .map_err(|e| format!("Failed to create server config: {}", e))?;
+        println!("🔍 Processing request for domain: {}", server_name);
 
         // Complete the TLS handshake
+        println!("🔍 About to complete TLS handshake for domain: {}", server_name);
+        println!("🔍 Server config has cert resolver: {:?}", std::any::type_name_of_val(&server_config.cert_resolver));
         let mut conn = match accepted.into_connection(Arc::new(server_config)) {
-            Ok(conn) => conn,
+            Ok(conn) => {
+                println!("✅ TLS handshake completed successfully for domain: {}", server_name);
+                conn
+            }
             Err((e, mut alert)) => {
-                alert.write_all(&mut stream)?;
+                println!("❌ Error completing TLS handshake: {}", e);
+                println!("🔍 Error details: {:?}", e);
+                let _ = alert.write_all(&mut stream);
                 return Err(format!("Error completing connection: {}", e).into());
             }
         };
 
         // Handle the connection
         println!("🔍 About to call process_https_request_static for domain: {}", server_name);
-        Self::process_https_request_static(&mut stream, &mut conn, &server_name, &extension_registry, &http_challenges, &secure_file_server).await?;
+        Self::process_https_request_static_blocking(&mut stream, &mut conn, &server_name, &extension_registry, &http_challenges, &secure_file_server)?;
         println!("🔍 process_https_request_static completed for domain: {}", server_name);
 
         Ok(())
     }
 
     /// Handle a single HTTPS connection
-    fn handle_connection(
-        &self,
-        mut stream: TcpStream,
-        cert_resolver: Arc<dyn ResolvesServerCert + Send + Sync>,
-        args: Args,
-        extension_registry: Arc<Mutex<ExtensionRegistry>>,
-        http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut acceptor = Acceptor::default();
 
-        // Read TLS packets until we have a complete ClientHello
-        let accepted = loop {
-            match acceptor.read_tls(&mut stream) {
-                Ok(0) => return Ok(()), // Connection closed
-                Ok(_) => {
-                    match acceptor.accept() {
-                        Ok(Some(accepted)) => break accepted,
-                        Ok(None) => continue,
-                        Err((e, mut alert)) => {
-                            alert.write_all(&mut stream)?;
-                            return Err(format!("Error accepting connection: {}", e).into());
-                        }
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No data available, continue
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        };
-
-        // Get the server name from ClientHello
-        let server_name = accepted.client_hello().server_name()
-            .map(|name| name.as_ref().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        println!("Processing request for domain: {}", server_name);
-
-        // Create server config with our certificate resolver
-        let server_config = ServerConfig::builder_with_provider(
-            rustls::crypto::aws_lc_rs::default_provider().into()
-        )
-        .with_no_client_auth()
-        .with_cert_resolver(cert_resolver)
-        .map_err(|e| format!("Failed to create server config: {}", e))?;
-
-        // Complete the TLS handshake
-        let mut conn = match accepted.into_connection(Arc::new(server_config)) {
-            Ok(conn) => conn,
-            Err((e, mut alert)) => {
-                alert.write_all(&mut stream)?;
-                return Err(format!("Error completing connection: {}", e).into());
-            }
-        };
-
-        // Handle the connection
-        self.process_https_request(&mut stream, &mut conn, &server_name, &extension_registry, &http_challenges)?;
-
-        Ok(())
-    }
-
-    /// Process HTTPS request and send response (static version for threading)
-    async fn process_https_request_static(
-        stream: &mut TcpStream,
+    /// Process HTTPS request and send response (blocking version for rustls)
+    fn process_https_request_static_blocking(
+        stream: &mut std::net::TcpStream,
         conn: &mut ServerConnection,
         server_name: &str,
         extension_registry: &Arc<Mutex<ExtensionRegistry>>,
         http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
         secure_file_server: &SecureFileServer,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("🔍 process_https_request_static started for domain: {}", server_name);
-        // Complete the handshake
-        println!("🔍 About to complete TLS handshake for domain: {}", server_name);
-        conn.complete_io(stream)?;
-        println!("🔍 TLS handshake completed for domain: {}", server_name);
+        // TLS handshake is already completed in the main connection handler
+        println!("🔍 TLS handshake already completed for domain: {}", server_name);
 
         // Read HTTP request using the TLS connection
         let mut buffer = [0; 4096];
@@ -1066,10 +1195,8 @@ impl OnDemandHttpsServer {
 
         println!("🔍 Starting to read HTTP request for domain: {}", server_name);
         
-        // Complete any pending TLS I/O before reading
-        println!("🔍 Completing pending TLS I/O for domain: {}", server_name);
-        conn.complete_io(stream)?;
-        println!("🔍 TLS I/O completed for domain: {}", server_name);
+        // TLS I/O is already completed in the main connection handler
+        println!("🔍 TLS I/O already completed for domain: {}", server_name);
         
         // Read data in a loop to handle partial reads
         let mut read_attempts = 0;
@@ -1083,35 +1210,56 @@ impl OnDemandHttpsServer {
             }
             
             println!("🔍 Attempting to read data for domain: {} (total_read: {}, attempt: {})", server_name, total_read, read_attempts);
-            match conn.reader().read(&mut buffer[total_read..]) {
-                Ok(0) => {
+            
+            // First, try to complete any pending TLS I/O
+            match conn.complete_io(stream) {
+                Ok((0, 0)) => {
                     println!("🔍 Connection closed for domain: {}", server_name);
                     break; // Connection closed
                 }
-                Ok(n) => {
-                    println!("🔍 Read {} bytes for domain: {}", n, server_name);
-                    total_read += n;
-                    if total_read >= buffer.len() {
-                        println!("🔍 Buffer full for domain: {}", server_name);
-                        break; // Buffer full
-                    }
-                    // Check if we have a complete HTTP request
-                    if let Ok(request_str) = std::str::from_utf8(&buffer[..total_read]) {
-                        println!("🔍 Current request data for domain {}: {}", server_name, request_str);
-                        if request_str.contains("\r\n\r\n") {
-                            println!("🔍 Complete HTTP request received for domain: {}", server_name);
-                            break; // Complete HTTP request received
+                Ok(_) => {
+                    // TLS I/O completed, now try to read data
+                    match conn.reader().read(&mut buffer[total_read..]) {
+                        Ok(0) => {
+                            println!("🔍 Connection closed for domain: {}", server_name);
+                            break; // Connection closed
+                        }
+                        Ok(n) => {
+                            println!("🔍 Read {} bytes for domain: {}", n, server_name);
+                            total_read += n;
+                            if total_read >= buffer.len() {
+                                println!("🔍 Buffer full for domain: {}", server_name);
+                                break; // Buffer full
+                            }
+                            // Check if we have a complete HTTP request
+                            if let Ok(request_str) = std::str::from_utf8(&buffer[..total_read]) {
+                                println!("🔍 Current request data for domain {}: {}", server_name, request_str);
+                                if request_str.contains("\r\n\r\n") {
+                                    println!("🔍 Complete HTTP request received for domain: {}", server_name);
+                                    break; // Complete HTTP request received
+                                }
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            println!("🔍 WouldBlock error for domain: {}, waiting... (attempt {})", server_name, read_attempts);
+                            // No data available, wait a bit
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
+                        }
+                        Err(e) => {
+                            println!("🔍 Read error for domain {}: {}", server_name, e);
+                            return Err(e.into());
                         }
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    println!("🔍 WouldBlock error for domain: {}, waiting... (attempt {})", server_name, read_attempts);
+                    println!("🔍 TLS I/O WouldBlock for domain: {}, waiting... (attempt {})", server_name, read_attempts);
                     // No data available, wait a bit
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     continue;
                 }
                 Err(e) => {
-                    println!("🔍 Read error for domain {}: {}", server_name, e);
+                    println!("🔍 TLS I/O error for domain {}: {}", server_name, e);
                     return Err(e.into());
                 }
             }
@@ -1275,12 +1423,12 @@ impl OnDemandHttpsServer {
     /// Process HTTPS request and send response
     fn process_https_request(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut std::net::TcpStream,
         conn: &mut ServerConnection,
         server_name: &str,
         extension_registry: &Arc<Mutex<ExtensionRegistry>>,
         http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Complete the handshake
         conn.complete_io(stream)?;
 
@@ -1381,10 +1529,10 @@ impl OnDemandHttpsServer {
     /// Send an error response (static version for threading)
     fn send_error_response_static(
         conn: &mut ServerConnection,
-        stream: &mut TcpStream,
+        stream: &mut std::net::TcpStream,
         status_code: u16,
         status_text: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let body = format!(
             "<!DOCTYPE html>\n\
              <html>\n\
@@ -1425,10 +1573,10 @@ impl OnDemandHttpsServer {
     /// Send an error response
     fn send_error_response(
         conn: &mut ServerConnection,
-        stream: &mut TcpStream,
+        stream: &mut std::net::TcpStream,
         status_code: u16,
         status_text: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let body = format!(
             "<!DOCTYPE html>\n\
              <html>\n\
@@ -1467,12 +1615,12 @@ impl OnDemandHttpsServer {
     }
 
     /// Handle HTTP-01 ACME challenge over HTTP (port 80)
-    fn handle_acme_challenge_http(
-        mut stream: TcpStream,
+    async fn handle_acme_challenge_http(
+        mut stream: tokio::net::TcpStream,
         request_line: &str,
         acme_client: &Option<Arc<AcmeClient>>,
         http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Extract token from request path
         // GET /.well-known/acme-challenge/{token} HTTP/1.1
         let path = request_line.split_whitespace().nth(1).unwrap_or("");
@@ -1508,20 +1656,20 @@ impl OnDemandHttpsServer {
             )
         };
 
-        stream.write_all(response.as_bytes())?;
-        stream.flush()?;
+        stream.write_all(response.as_bytes()).await?;
+        stream.flush().await?;
 
         Ok(())
     }
 
     /// Handle HTTP-01 ACME challenge over HTTPS (port 443) - static version for threading
     fn handle_acme_challenge_static(
-        stream: &mut TcpStream,
+        stream: &mut std::net::TcpStream,
         conn: &mut ServerConnection,
         request_line: &str,
         acme_client: &Option<Arc<AcmeClient>>,
         http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Extract token from request path
         // GET /.well-known/acme-challenge/{token} HTTP/1.1
         let path = request_line.split_whitespace().nth(1).unwrap_or("");
@@ -1566,12 +1714,12 @@ impl OnDemandHttpsServer {
 
     /// Handle HTTP-01 ACME challenge over HTTPS (port 443)
     fn handle_acme_challenge(
-        stream: &mut TcpStream,
+        stream: &mut std::net::TcpStream,
         conn: &mut ServerConnection,
         request_line: &str,
         acme_client: &Option<Arc<AcmeClient>>,
         http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Extract token from request path
         // GET /.well-known/acme-challenge/{token} HTTP/1.1
         let path = request_line.split_whitespace().nth(1).unwrap_or("");
@@ -1647,8 +1795,12 @@ impl OnDemandHttpsServer {
     ) -> Option<String> {
         // Try to get from ACME client if available
         if let Some(acme_client) = acme_client {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            if let Some(response) = rt.block_on(acme_client.get_challenge_response(token)) {
+            // Use block_in_place to handle the async call within the existing runtime
+            if let Some(response) = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::try_current()
+                    .unwrap()
+                    .block_on(acme_client.get_challenge_response(token))
+            }) {
                 return Some(response);
             }
         }
@@ -1676,8 +1828,12 @@ impl OnDemandHttpsServer {
     ) -> Option<String> {
         // Try to get from ACME client if available
         if let Some(acme_client) = acme_client {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            if let Some(response) = rt.block_on(acme_client.get_challenge_response(token)) {
+            // Use block_in_place to handle the async call within the existing runtime
+            if let Some(response) = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::try_current()
+                    .unwrap()
+                    .block_on(acme_client.get_challenge_response(token))
+            }) {
                 return Some(response);
             }
         }
@@ -1696,6 +1852,8 @@ impl OnDemandHttpsServer {
             None
         }
     }
+
+    // No more challenge syncing needed - challenges are accessed directly from ACME client
 }
 
 
@@ -1736,76 +1894,7 @@ fn ensure_tmp_acme_permissions(uid: u32, gid: u32) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// Domain request log entry
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct DomainRequestLog {
-    domain: String,
-    timestamp: std::time::SystemTime,
-    is_production: bool,
-    bogus_domain: Option<String>,
-}
-
-/// Domain request logger
-struct DomainRequestLogger {
-    log_file: std::path::PathBuf,
-    requests: Vec<DomainRequestLog>,
-}
-
-impl DomainRequestLogger {
-    fn new(cache_dir: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let log_file = std::path::PathBuf::from(cache_dir).join("domain_requests.json");
-        let mut logger = Self {
-            log_file,
-            requests: Vec::new(),
-        };
-        logger.load()?;
-        Ok(logger)
-    }
-
-    fn load(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.log_file.exists() {
-            let content = std::fs::read_to_string(&self.log_file)?;
-            self.requests = serde_json::from_str(&content).unwrap_or_default();
-        }
-        Ok(())
-    }
-
-    fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let content = serde_json::to_string_pretty(&self.requests)?;
-        std::fs::write(&self.log_file, content)?;
-        Ok(())
-    }
-
-    fn log_request(&mut self, domain: &str, is_production: bool, bogus_domain: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        let entry = DomainRequestLog {
-            domain: domain.to_string(),
-            timestamp: std::time::SystemTime::now(),
-            is_production,
-            bogus_domain: bogus_domain.map(|s| s.to_string()),
-        };
-        
-        // Check if this is a new production certificate for a previously logged domain
-        if is_production {
-            for existing in &self.requests {
-                if existing.domain == domain && !existing.is_production {
-                    println!("⚠️  WARNING: PRODUCTION CERTIFICATE REQUESTED FOR PREVIOUSLY LOGGED DOMAIN!");
-                    println!("   Domain: {}", domain);
-                    println!("   Previous request was non-production at: {:?}", existing.timestamp);
-                    println!("   This may indicate rate limit workaround usage!");
-                    println!("   ⚠️  WARNING: PRODUCTION CERTIFICATE REQUESTED FOR PREVIOUSLY LOGGED DOMAIN! ⚠️");
-                }
-            }
-        }
-        
-        self.requests.push(entry);
-        self.save()?;
-        Ok(())
-    }
-
-    fn has_been_requested(&self, domain: &str) -> bool {
-        self.requests.iter().any(|r| r.domain == domain)
-    }
-}
+// DomainRequestLogger removed - was unused dead code
 
 
 /// Ensure certificate cache directory has proper ownership for www-data
@@ -2040,10 +2129,11 @@ fn get_domains(cache_dir: &str) -> Result<Vec<String>, Box<dyn std::error::Error
     // Scan certificate cache directory for domains
     let cache_path = std::path::Path::new(cache_dir);
     if cache_path.exists() {
-        // Recursively find all certificate files
-        if let Ok(entries) = walkdir::WalkDir::new(cache_path).into_iter().collect::<Result<Vec<_>, _>>() {
+        // Find certificate files in the cache directory (non-recursive)
+        if let Ok(entries) = std::fs::read_dir(cache_path) {
             for entry in entries {
-                if let Some(file_name) = entry.file_name().to_str() {
+                if let Ok(entry) = entry {
+                    if let Some(file_name) = entry.file_name().to_str() {
                     // Look for various certificate file patterns
                     if file_name.ends_with(".crt") || file_name.ends_with(".pem") {
                         // Extract domain from filename patterns like:
@@ -2075,6 +2165,7 @@ fn get_domains(cache_dir: &str) -> Result<Vec<String>, Box<dyn std::error::Error
                             && !domain.starts_with("acme_") {
                             domains.push(domain);
                         }
+                    }
                     }
                 }
             }
@@ -2109,7 +2200,11 @@ fn print_admin_urls(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     debug_extensions_enabled();
     println!("🚀 EasyPeas HTTPS Server starting - Debug version with enhanced ACME integration");
-    let args = Args::parse();
+    let args = Args::parse().unwrap_or_else(|e| {
+        eprintln!("Error parsing arguments: {}", e);
+        eprintln!("Use --help for usage information");
+        std::process::exit(1);
+    });
 
     // Handle --admin-urls option
     if args.admin_urls {
@@ -2117,19 +2212,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Initialize logging
+    // Initialize simple logging
     if args.verbose {
-        env_logger::Builder::new()
-            .parse_filters("debug")
-            .init();
+        log::set_max_level(log::LevelFilter::Debug);
     } else {
-        env_logger::Builder::new()
-            .parse_filters("info")
-            .init();
+        log::set_max_level(log::LevelFilter::Info);
     }
+    
+    // Simple console logger without regex dependency
+    log::set_logger(&SimpleLogger).unwrap();
 
     // Create and run server
-    let server = OnDemandHttpsServer::new(args)?;
+    let server = OnDemandHttpsServer::new(args).await?;
     server.run().await?;
 
     Ok(())
