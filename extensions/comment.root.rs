@@ -60,7 +60,7 @@ pub fn setup_comment_directories() -> Result<(), String> {
         let www_data_gid = get_www_data_gid()?;
         
         // Create the comments directory
-        let comments_dir = Path::new("/var/spool/easypeas/comments");
+        let comments_dir = Path::new("/var/spool/easyp/comments");
         if !comments_dir.exists() {
             fs::create_dir_all(comments_dir)
                 .map_err(|e| format!("Failed to create comments directory: {}", e))?;

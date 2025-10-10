@@ -1,12 +1,13 @@
 #!/bin/bash
 
-# Deploy script for EasyPeas HTTPS server
+# Deploy script for easyp HTTPS server
 # Usage: ./deploy.sh <target_host>
 
 set -e  # Exit on any error
 
 STAGING=--staging
-#STAGING=
+STAGING=
+PROFILE=lto
 		  
 KEEPALIVE=y
 
@@ -30,18 +31,22 @@ source ~/.cargo/env
 
 # Build if needed
 [ -f target/debug/easyp ] || RUSTC_WRAPPER= cargo build --bin easyp
-if [ -z "$(find examples/src/ ../acme-lib/src/ ../rustls/src ../rustls-acme/src -type f -newer target/debug/easyp 2>/dev/null)" ] || RUSTC_WRAPPER= cargo build --bin easyp
+if [ -z "$(find src/ */src/ -type f -newer target/debug/easyp 2>/dev/null)" ] || RUSTC_WRAPPER= cargo build --bin easyp --profile $PROFILE
 then
 	echo "DEBUG: Building completed, starting deployment..."
 	
 	echo "DEBUG: Killing existing easyp processes on remote server..."
 	ssh root@$SRV "pkill easyp;sleep 1;pkill -9 easyp; true" && echo "DEBUG: Process cleanup completed"
 	
+	echo "DEBUG: Ensuring certificate directories are properly separated..."
+	ssh root@$SRV "mkdir -p /var/lib/easyp/certs/staging /var/lib/easyp/certs/production" && echo "DEBUG: Certificate directories prepared"
+	
 	echo "DEBUG: Syncing binary to remote server..."
-	rsync -avz target/debug/easyp root@$SRV: && echo "DEBUG: Binary sync completed"
+	rsync -avz ../target/$PROFILE/easyp root@$SRV: && echo "DEBUG: Binary sync completed"
 	
 	echo "DEBUG: Starting server in background..."
-	ssh root@$SRV "pkill easyp; chmod +x easyp; nohup ./easyp --root /var/www/html --staging $VERBOSE $STAGING_FLAG $BOGUS > server.log 2>&1 &"
+	echo "DEBUG: Using staging flag: [$STAGING]"
+	ssh root@$SRV "pkill easyp; chmod +x easyp; nohup ./easyp --root /var/www/html $STAGING $VERBOSE $BOGUS > server.log 2>&1 &"
 	echo "DEBUG: Server startup command sent to remote server"
 	
 	echo "DEBUG: Waiting 10 seconds for server to initialize..."
@@ -110,6 +115,51 @@ then
 	fi
 	
 	sleep 1
+	
+	echo "DEBUG: Testing certificate stability..."
+	echo === CERTIFICATE STABILITY TEST ===
+	CERT1=$(timeout 15 openssl s_client -connect $SRV:443 -servername $SRV < /dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout 2>/dev/null | cut -d= -f2)
+	sleep 3
+	CERT2=$(timeout 15 openssl s_client -connect $SRV:443 -servername $SRV < /dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout 2>/dev/null | cut -d= -f2)
+	
+	if [ -z "$CERT1" ] || [ -z "$CERT2" ]; then
+		echo "ERROR: Certificate fingerprint test failed - could not retrieve certificates"
+		exit 1
+	fi
+	
+	if [ "$CERT1" != "$CERT2" ]; then
+		echo "ERROR: Certificate stability test failed - certificate changed between requests"
+		echo "   First cert:  $CERT1"
+		echo "   Second cert: $CERT2"
+		exit 1
+	else
+		echo "DEBUG: Certificate stability test passed - same certificate on multiple requests"
+	fi
+	
+	echo "DEBUG: Testing wget with security disabled..."
+	echo === WGET TEST ===
+	if ! timeout 20 wget --no-check-certificate --timeout=15 --tries=1 -q -O /tmp/wget_remote_test.html "https://$SRV" 2>/dev/null; then
+		echo "ERROR: wget test failed"
+		exit 1
+	fi
+	
+	# Check if wget got non-empty content
+	if [ ! -s /tmp/wget_remote_test.html ]; then
+		echo "ERROR: wget test failed - received empty response"
+		exit 1
+	fi
+	
+	# Check if content looks like HTML
+	if ! grep -q "<html\|<!DOCTYPE" /tmp/wget_remote_test.html 2>/dev/null; then
+		echo "ERROR: wget test failed - response doesn't appear to be HTML"
+		echo "   Response content:"
+		head -5 /tmp/wget_remote_test.html
+		exit 1
+	fi
+	
+	echo "DEBUG: wget test passed - received valid HTML content"
+	rm -f /tmp/wget_remote_test.html
+	
 	echo === END TESTS ===
 	
 	if [ -z "$KEEPALIVE" ]

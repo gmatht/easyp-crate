@@ -12,12 +12,13 @@ use std::io::Read;
 use std::path::{Path, PathBuf, Component};
 
 // Unix-specific imports for privilege dropping
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+//#[cfg(unix)]
+// use std::os::unix::fs::PermissionsExt; // Not currently used
 
 /// MIME type mappings for common file extensions
 #[derive(Debug, Clone)]
 pub struct MimeTypes {
+    //TODO: Should this be &str, &str?
     types: HashMap<String, String>,
 }
 
@@ -153,6 +154,57 @@ impl SecureFileServer {
         }
     }
 
+    /// Validate if a domain is safe for file serving
+    /// A safe domain:
+    /// - Contains only alphanumeric characters and dots
+    /// - Does not contain ".." (directory traversal)
+    /// - Contains at least one dot
+    pub fn is_domain_safe(domain: &str) -> bool {
+        // Check if domain contains only alphanumeric characters and dots
+        if !domain.chars().all(|c| c.is_alphanumeric() || c == '.') {
+            return false;
+        }
+        
+        // Check if domain contains ".." (directory traversal)
+        if domain.contains("..") {
+            return false;
+        }
+        
+        // Check if domain contains at least one dot
+        if !domain.contains('.') {
+            return false;
+        }
+        
+        // Additional safety checks
+        // Domain should not start or end with a dot
+        if domain.starts_with('.') || domain.ends_with('.') {
+            return false;
+        }
+        
+        // Domain should not have consecutive dots
+        if domain.contains("...") {
+            return false;
+        }
+        
+        true
+    }
+
+    /// Get the document root for a specific domain
+    /// Returns /var/www/DOMAIN if it exists and domain is safe, otherwise falls back to default
+    pub fn get_domain_document_root(&self, domain: &str) -> PathBuf {
+        if Self::is_domain_safe(domain) {
+            let domain_path = PathBuf::from("/var/www").join(domain);
+            if domain_path.exists() && domain_path.is_dir() {
+                println!("Using domain-specific document root: {}", domain_path.display());
+                return domain_path;
+            }
+        }
+        
+        // Fall back to default document root
+        println!("Using default document root: {}", self.config.document_root.display());
+        self.config.document_root.clone()
+    }
+
     /// Drop privileges to specified user/group
     pub fn drop_privileges(&self) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(unix)]
@@ -195,6 +247,11 @@ impl SecureFileServer {
 
     /// Sanitize and canonicalize a path to prevent directory traversal attacks
     pub fn sanitize_path(&self, request_path: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        self.sanitize_path_with_root(request_path, &self.config.document_root)
+    }
+
+    /// Sanitize and canonicalize a path with a specific document root
+    pub fn sanitize_path_with_root(&self, request_path: &str, document_root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
         // Remove any query parameters or fragments
         let path = request_path.split('?').next().unwrap_or(request_path);
         let path = path.split('#').next().unwrap_or(path);
@@ -225,7 +282,7 @@ impl SecureFileServer {
                 }
                 Component::RootDir => {
                     // Absolute path - start from document root
-                    path_buf = self.config.document_root.clone();
+                    path_buf = document_root.to_path_buf();
                 }
                 Component::CurDir => {
                     // Current directory - ignore
@@ -237,7 +294,7 @@ impl SecureFileServer {
         }
 
         // If path is empty or just root, try to serve index.html
-        if path_buf == PathBuf::new() || path_buf == self.config.document_root {
+        if path_buf == PathBuf::new() || path_buf == document_root {
             path_buf.push("index.html");
         }
 
@@ -254,7 +311,7 @@ impl SecureFileServer {
         };
 
         // Ensure the canonical path is within the document root
-        if !canonical_path.starts_with(&self.config.document_root) {
+        if !canonical_path.starts_with(document_root) {
             return Err("Path outside document root not allowed".into());
         }
 
@@ -304,14 +361,27 @@ impl SecureFileServer {
     /// Check if a path should redirect (directory without trailing slash)
     /// Returns Some(redirect_url) if redirect is needed, None otherwise
     pub fn check_redirect(&self, request_path: &str) -> Option<String> {
+        self.check_redirect_with_domain(request_path, None)
+    }
+
+    /// Check if a path should redirect with domain-specific document root
+    /// Returns Some(redirect_url) if redirect is needed, None otherwise
+    pub fn check_redirect_with_domain(&self, request_path: &str, domain: Option<&str>) -> Option<String> {
         // Only check for redirects if path doesn't end with slash
         if request_path.ends_with('/') {
             return None;
         }
 
+        // Get the appropriate document root for this domain
+        let document_root = if let Some(domain) = domain {
+            self.get_domain_document_root(domain)
+        } else {
+            self.config.document_root.clone()
+        };
+
         // Build the full path to check if it's a directory
         let clean_path = request_path.trim_start_matches('/');
-        let file_path = self.config.document_root.join(clean_path);
+        let file_path = document_root.join(clean_path);
         
         // Check if the path is a directory
         if file_path.is_dir() {
@@ -328,8 +398,15 @@ impl SecureFileServer {
     /// Returns Ok(None) if file doesn't exist, Ok(Some(content)) if file exists
     /// Returns Ok(Some(redirect_response)) if redirect is needed
     pub fn serve_file(&self, request_path: &str) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-        // Check for redirects first
-        if let Some(redirect_url) = self.check_redirect(request_path) {
+        self.serve_file_with_domain(request_path, None)
+    }
+
+    /// Serve a file with domain-specific document root
+    /// Returns Ok(None) if file doesn't exist, Ok(Some(content)) if file exists
+    /// Returns Ok(Some(redirect_response)) if redirect is needed
+    pub fn serve_file_with_domain(&self, request_path: &str, domain: Option<&str>) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+        // Check for redirects first using domain-specific document root
+        if let Some(redirect_url) = self.check_redirect_with_domain(request_path, domain) {
             let response = format!(
                 "HTTP/1.1 301 Moved Permanently\r\nLocation: {}\r\nContent-Length: 0\r\n\r\n",
                 redirect_url
@@ -337,10 +414,17 @@ impl SecureFileServer {
             return Ok(Some(response.as_bytes().to_vec()));
         }
 
+        // Get the appropriate document root for this domain
+        let document_root = if let Some(domain) = domain {
+            self.get_domain_document_root(domain)
+        } else {
+            self.config.document_root.clone()
+        };
+
         // Handle directory requests (paths ending with /)
         if request_path.ends_with('/') {
             let clean_path = request_path.trim_start_matches('/');
-            let dir_path = self.config.document_root.join(clean_path);
+            let dir_path = document_root.join(clean_path);
             
             if dir_path.is_dir() {
                 // Try to serve index.html or index.htm from the directory
@@ -378,8 +462,8 @@ impl SecureFileServer {
             }
         }
 
-        // For regular file requests, use the existing sanitize_path logic
-        let file_path = match self.sanitize_path(request_path) {
+        // For regular file requests, use the existing sanitize_path logic with domain-specific root
+        let file_path = match self.sanitize_path_with_root(request_path, &document_root) {
             Ok(path) => path,
             Err(e) => {
                 println!("Security error serving {}: {}", request_path, e);
@@ -481,7 +565,7 @@ impl SecureFileServer {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EasyPeas HTTPS Server</title>
+    <title>easyp HTTPS Server</title>
     <style>
         body {{
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -589,7 +673,7 @@ impl SecureFileServer {
 <body>
     <div class="container">
         <div class="header">
-            <h1>🔒 EasyPeas HTTPS Server</h1>
+            <h1>🔒 easyp HTTPS Server</h1>
             <p>Secure web server with automatic ACME certificate management</p>
             <div class="status-badge">🟢 Running</div>
         </div>

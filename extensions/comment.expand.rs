@@ -328,7 +328,7 @@ fn load_live_comments(md5_hash: &str) -> String {
     use std::fs;
     use std::path::Path;
     
-    let live_file = Path::new("/var/spool/easypeas/comments/live").join(md5_hash);
+    let live_file = Path::new("/var/spool/easyp/comments/live").join(md5_hash);
     
     if !live_file.exists() {
         return String::new();

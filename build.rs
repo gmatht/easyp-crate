@@ -120,7 +120,7 @@ fn main() -> std::io::Result<()> {
     out.push_str("    }\n\n");
 
     out.push_str("    pub fn process_html(&self, html: &str, url: &str) -> String {\n");
-    out.push_str("        // Process HTML with extensions\n");
+    out.push_str("        // Process HTML with extensions using simple string operations\n");
     out.push_str("        let mut result = html.to_string();\n");
     out.push_str("        \n");
     
@@ -131,10 +131,6 @@ fn main() -> std::io::Result<()> {
             if let Some(file_name) = entry.file_name().to_str() {
                 if file_name.ends_with(".expand.rs") {
                     let ext_name = file_name.replace(".expand.rs", "");
-                    out.push_str(&format!(
-                        "        // Process #EXTEND:{}() directives\n",
-                        ext_name
-                    ));
                     out.push_str(&format!(
                         "        // Process #EXTEND:{}() directives using simple string operations\n",
                         ext_name
@@ -195,7 +191,7 @@ fn main() -> std::io::Result<()> {
     // Add missing methods that the main code expects
     out.push_str("    pub fn load_existing_admin_keys(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {\n");
     out.push_str("        // Load existing admin keys from file system\n");
-    out.push_str("        let admin_keys_file = std::path::Path::new(\"/var/lib/easypeas/admin_keys\");\n");
+    out.push_str("        let admin_keys_file = std::path::Path::new(\"/var/lib/easyp/admin_keys\");\n");
     out.push_str("        if admin_keys_file.exists() {\n");
     out.push_str("            if let Ok(content) = std::fs::read_to_string(admin_keys_file) {\n");
     out.push_str("                for line in content.lines() {\n");
@@ -228,7 +224,7 @@ fn main() -> std::io::Result<()> {
     out.push_str("        }\n");
     out.push_str("        \n");
     out.push_str("        if needs_save {\n");
-    out.push_str("            let admin_keys_file = std::path::Path::new(\"/var/lib/easypeas/admin_keys\");\n");
+    out.push_str("            let admin_keys_file = std::path::Path::new(\"/var/lib/easyp/admin_keys\");\n");
     out.push_str("            if let Some(parent) = admin_keys_file.parent() {\n");
     out.push_str("                let _ = std::fs::create_dir_all(parent);\n");
     out.push_str("            }\n");
@@ -248,6 +244,32 @@ fn main() -> std::io::Result<()> {
 
     out.push_str("    pub fn initialize_root_extensions(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {\n");
     out.push_str("        // Initialize root extensions\n");
+    
+    // Dynamically generate root extension initialization for each .root.rs file
+    let extensions_dir = std::path::Path::new("extensions");
+    if let Ok(entries) = std::fs::read_dir(extensions_dir) {
+        for entry in entries.flatten() {
+            if let Some(file_name) = entry.file_name().to_str() {
+                if file_name.ends_with(".root.rs") {
+                    let ext_name = file_name.replace(".root.rs", "");
+                    out.push_str(&format!(
+                        "        // Initialize {} root extension\n",
+                        ext_name
+                    ));
+                    out.push_str(&format!(
+                        "        if let Err(e) = {}_root::setup_{}_directories() {{\n",
+                        ext_name, ext_name
+                    ));
+                    out.push_str(&format!(
+                        "            println!(\"Warning: Failed to initialize {} root extension: {{}}\", e);\n",
+                        ext_name
+                    ));
+                    out.push_str("        }\n");
+                }
+            }
+        }
+    }
+    
     out.push_str("        Ok(())\n");
     out.push_str("    }\n\n");
 

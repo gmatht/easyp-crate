@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 // Archive processing file with timestamp
 fn archive_processing_file() -> Result<(), String> {
-    let comments_dir = Path::new("/var/spool/easypeas/comments");
+    let comments_dir = Path::new("/var/spool/easyp/comments");
     let processing_file = comments_dir.join("processing");
     
     if processing_file.exists() {
@@ -32,7 +32,7 @@ fn archive_processing_file() -> Result<(), String> {
 
 // Create live comments directory
 fn create_live_comments_dir() -> Result<(), String> {
-    let live_dir = Path::new("/var/spool/easypeas/comments/live");
+    let live_dir = Path::new("/var/spool/easyp/comments/live");
     
     if !live_dir.exists() {
         std::fs::create_dir_all(live_dir)
@@ -137,7 +137,7 @@ fn url_decode(s: &str) -> Result<String, String> {
 
 // Move comments from 'in' to 'processing' if processing doesn't exist
 fn move_comments_to_processing() -> Result<(), String> {
-    let comments_dir = Path::new("/var/spool/easypeas/comments");
+    let comments_dir = Path::new("/var/spool/easyp/comments");
     let in_file = comments_dir.join("in");
     let processing_file = comments_dir.join("processing");
     
@@ -167,7 +167,7 @@ fn move_comments_to_processing() -> Result<(), String> {
 
 // Get comments from processing file
 fn get_comments() -> Result<Vec<String>, String> {
-    let processing_file = Path::new("/var/spool/easypeas/comments/processing");
+    let processing_file = Path::new("/var/spool/easyp/comments/processing");
     
     if !processing_file.exists() {
         return Ok(Vec::new());
@@ -191,7 +191,7 @@ fn accept_comment(comment: &str) -> Result<(), String> {
         comment
     };
     
-    let comments_dir = Path::new("/var/spool/easypeas/comments");
+    let comments_dir = Path::new("/var/spool/easyp/comments");
     let accept_file = comments_dir.join("accept");
     
     // Append to accept file
@@ -219,7 +219,7 @@ fn accept_comment(comment: &str) -> Result<(), String> {
             writeln!(debug_handle, "DEBUG: Clean comment: {}", clean_comment).unwrap_or_default();
             writeln!(debug_handle, "DEBUG: MD5 hash: {}", md5_hash).unwrap_or_default();
             
-            let live_file = Path::new("/var/spool/easypeas/comments/live").join(&md5_hash);
+            let live_file = Path::new("/var/spool/easyp/comments/live").join(&md5_hash);
             writeln!(debug_handle, "DEBUG: Live file path: {:?}", live_file).unwrap_or_default();
             
             let mut live_file_handle = fs::OpenOptions::new()
@@ -257,7 +257,7 @@ fn reject_comment(comment: &str) -> Result<(), String> {
         comment
     };
     
-    let comments_dir = Path::new("/var/spool/easypeas/comments");
+    let comments_dir = Path::new("/var/spool/easyp/comments");
     let reject_file = comments_dir.join("reject");
     
     // Append to reject file
@@ -311,7 +311,7 @@ fn generate_success_page(accepted_count: usize, rejected_count: usize, admin_key
     
     // Show last 10 lines of accept file
     html.push_str("<h2>[ACCEPTED] Recent Accepted Comments</h2>\n");
-    match get_last_lines("/var/spool/easypeas/comments/accept", 10) {
+    match get_last_lines("/var/spool/easyp/comments/accept", 10) {
         Ok(lines) => {
             if lines.is_empty() {
                 html.push_str("<div class=\"file-content\">No accepted comments yet.</div>\n");
@@ -331,7 +331,7 @@ fn generate_success_page(accepted_count: usize, rejected_count: usize, admin_key
     
     // Show last 10 lines of reject file
     html.push_str("<h2>[REJECTED] Recent Rejected Comments</h2>\n");
-    match get_last_lines("/var/spool/easypeas/comments/reject", 10) {
+    match get_last_lines("/var/spool/easyp/comments/reject", 10) {
         Ok(lines) => {
             if lines.is_empty() {
                 html.push_str("<div class=\"file-content\">No rejected comments yet.</div>\n");
@@ -349,9 +349,6 @@ fn generate_success_page(accepted_count: usize, rejected_count: usize, admin_key
         }
     }
     
-    html.push_str("<div style=\"margin-top: 30px;\">\n");
-    html.push_str(&format!("<a href=\"/comment_{}\" class=\"btn btn-primary\">← Back to Moderation Panel</a>\n", admin_key));
-    html.push_str("</div>\n");
     
     html.push_str("</body>\n");
     html.push_str("</html>\n");
@@ -371,7 +368,7 @@ fn get_last_lines(file_path: &str, n: usize) -> Result<Vec<String>, String> {
 }
 
 // Generate admin panel HTML
-fn generate_admin_panel(comments: &[String]) -> String {
+fn generate_admin_panel(comments: &[String], admin_key: &str) -> String {
     let mut html = String::new();
     
     html.push_str("<!DOCTYPE html>\n");
@@ -417,6 +414,7 @@ fn generate_admin_panel(comments: &[String]) -> String {
         html.push_str("</div>\n");
         html.push_str("</form>\n");
     }
+    
     
     html.push_str("</body>\n");
     html.push_str("</html>\n");
@@ -566,7 +564,7 @@ pub fn handle_comment_admin_request(
             }
         };
         
-        let html = generate_admin_panel(&comments);
+        let html = generate_admin_panel(&comments, admin_key);
         
         return Ok(format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n{}",
