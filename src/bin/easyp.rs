@@ -1175,8 +1175,7 @@ impl OnDemandHttpsServer {
         match serve_result {
             Ok(Some(file_content)) => {
                 // Check if this is a redirect response (starts with "HTTP/1.1 301")
-                let content_str = String::from_utf8_lossy(&file_content);
-                if content_str.starts_with("HTTP/1.1 301") {
+                if file_content.starts_with(b"HTTP/1.1 301") {
                     // This is a redirect response, send it directly
                     stream.write_all(&file_content).await?;
                     stream.flush().await?;
@@ -1749,8 +1748,7 @@ impl OnDemandHttpsServer {
         match secure_file_server.serve_file_with_domain(request_path, Some(server_name)) {
             Ok(Some(file_content)) => {
                 // Check if this is a redirect response (starts with "HTTP/1.1 301")
-                let content_str = String::from_utf8_lossy(&file_content);
-                if content_str.starts_with("HTTP/1.1 301") {
+                if file_content.starts_with(b"HTTP/1.1 301") {
                     // This is a redirect response, send it directly
                     conn.writer().write_all(&file_content)?;
                     conn.write_tls(stream)?;
