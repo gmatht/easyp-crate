@@ -28,42 +28,43 @@ impl Default for MimeTypes {
 
         // HTML and text files
         types.insert("html".to_string(), "text/html; charset=utf-8".to_string());
-        types.insert("htm".to_string(), "text/html; charset=utf-8".to_string());
-        types.insert("txt".to_string(), "text/plain; charset=utf-8".to_string());
-        types.insert("css".to_string(), "text/css; charset=utf-8".to_string());
+        types.insert("htm".to_string(),  "text/html; charset=utf-8".to_string());
+        types.insert("txt".to_string(),  "text/plain; charset=utf-8".to_string());
+        types.insert("css".to_string(),  "text/css; charset=utf-8".to_string());
 
         // JavaScript
-        types.insert("js".to_string(), "application/javascript; charset=utf-8".to_string());
-        types.insert("mjs".to_string(), "application/javascript; charset=utf-8".to_string());
+        types.insert("js".to_string(),   "application/javascript; charset=utf-8".to_string());
+        types.insert("mjs".to_string(),  "application/javascript; charset=utf-8".to_string());
 
         // WebAssembly
         types.insert("wasm".to_string(), "application/wasm".to_string());
 
         // Images
-        types.insert("jpg".to_string(), "image/jpeg".to_string());
+        types.insert("jpg".to_string(),  "image/jpeg".to_string());
         types.insert("jpeg".to_string(), "image/jpeg".to_string());
-        types.insert("png".to_string(), "image/png".to_string());
-        types.insert("gif".to_string(), "image/gif".to_string());
-        types.insert("svg".to_string(), "image/svg+xml".to_string());
+        types.insert("png".to_string(),  "image/png".to_string());
+        types.insert("gif".to_string(),  "image/gif".to_string());
+        types.insert("svg".to_string(),  "image/svg+xml".to_string());
         types.insert("webp".to_string(), "image/webp".to_string());
-        types.insert("ico".to_string(), "image/x-icon".to_string());
-        types.insert("bmp".to_string(), "image/bmp".to_string());
+        types.insert("ico".to_string(),  "image/x-icon".to_string());
+        types.insert("bmp".to_string(),  "image/bmp".to_string());
 
         // Fonts
-        types.insert("woff".to_string(), "font/woff".to_string());
+        types.insert("woff".to_string(),  "font/woff".to_string());
         types.insert("woff2".to_string(), "font/woff2".to_string());
-        types.insert("ttf".to_string(), "font/ttf".to_string());
-        types.insert("otf".to_string(), "font/otf".to_string());
+        types.insert("ttf".to_string(),   "font/ttf".to_string());
+        types.insert("otf".to_string(),   "font/otf".to_string());
 
         // Documents
-        types.insert("pdf".to_string(), "application/pdf".to_string());
+        types.insert("pdf".to_string(),  "application/pdf".to_string());
         types.insert("json".to_string(), "application/json; charset=utf-8".to_string());
-        types.insert("xml".to_string(), "application/xml; charset=utf-8".to_string());
+        types.insert("xml".to_string(),  "application/xml; charset=utf-8".to_string());
 
         // Archives
         types.insert("zip".to_string(), "application/zip".to_string());
         types.insert("tar".to_string(), "application/x-tar".to_string());
-        types.insert("gz".to_string(), "application/gzip".to_string());
+        types.insert("gz".to_string(),  "application/gzip".to_string());
+        types.insert("tgz".to_string(), "application/gzip".to_string());
 
         // Default binary type
         types.insert("bin".to_string(), "application/octet-stream".to_string());
@@ -109,7 +110,7 @@ impl Default for SecurityConfig {
         Self {
             document_root: PathBuf::from("/var/www/html"),
             follow_symlinks: false,
-            max_file_size: 10 * 1024 * 1024, // 10MB
+            max_file_size: 10 * 1024 * 1024 * 1024 * 1024, // 10TB
             allowed_extensions: vec![],
             blocked_extensions: vec![
 /* // You could consider blocking these extensions by default for security
@@ -269,7 +270,7 @@ impl SecureFileServer {
                     // Check for directory traversal attempts
                     if comp == ".." || comp.to_string_lossy().contains("..") {
                         return Err("Directory traversal attack detected".into());
-                    }
+                    T
 
                     // Check for hidden files/directories (starting with .)
                     if let Some(comp_str) = comp.to_str() {
