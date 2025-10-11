@@ -270,7 +270,7 @@ impl SecureFileServer {
                     // Check for directory traversal attempts
                     if comp == ".." || comp.to_string_lossy().contains("..") {
                         return Err("Directory traversal attack detected".into());
-                    T
+                    }
 
                     // Check for hidden files/directories (starting with .)
                     if let Some(comp_str) = comp.to_str() {

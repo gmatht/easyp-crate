@@ -545,8 +545,9 @@ impl OnDemandHttpsServer {
         let secure_file_server = SecureFileServer::new(SecurityConfig {
             document_root,
             follow_symlinks: false, // Security: don't follow symlinks by default
-            max_file_size: 10 * 1024 * 1024, // 10MB max file size
+            max_file_size: 10 * 1024 * 1024 * 1024 * 1024, // 10TB max file size
             allowed_extensions: vec![
+/*
                 // Web files
                 "html".to_string(), "htm".to_string(), "css".to_string(),
                 "js".to_string(), "json".to_string(),
@@ -560,12 +561,15 @@ impl OnDemandHttpsServer {
                 "txt".to_string(), "pdf".to_string(),
                 // Archives
                 "zip".to_string(), "tar".to_string(), "gz".to_string(),
+*/
             ],
             blocked_extensions: vec![
+/*
                 // Dangerous executables
                 "exe".to_string(), "bat".to_string(), "cmd".to_string(),
                 "com".to_string(), "pif".to_string(), "scr".to_string(),
                 "vbs".to_string(), "jar".to_string(), "sh".to_string(),
+*/
                 // System files
                 "htaccess".to_string(), "htpasswd".to_string(),
             ],
@@ -585,10 +589,18 @@ impl OnDemandHttpsServer {
                } else {
                    println!("[{}] No allowed IPs specified, auto-detecting server IPs...", 
                  std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
-                   detect_server_ips().unwrap_or_else(|e| {
-                       println!("Warning: Could not detect server IPs ({}), using localhost fallback", e);
-                       vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))]
-                   })
+                   let detected_ips = detect_server_ips().unwrap_or_else(|e| {
+                       println!("Warning: Could not detect server IPs ({}), returning empty list", e);
+                       Vec::new()
+                   });
+                   
+                   if detected_ips.is_empty() {
+                       eprintln!("Error: No valid IP addresses detected. Please specify --allowed-ips explicitly.");
+                       eprintln!("This is required for security - localhost addresses are not allowed for ACME requests.");
+                       std::process::exit(1);
+                   }
+                   
+                   detected_ips
                };
 
                // Create certificate resolver with real ACME integration
@@ -1227,14 +1239,32 @@ impl OnDemandHttpsServer {
                     // Write headers first
                     stream.write_all(response_bytes).await?;
                     
-                    // Write content in chunks
+                    // Write content in chunks with proper partial write handling
                     const CHUNK_SIZE: usize = 8192; // 8KB chunks
                     let mut offset = 0;
                     while offset < content_bytes.len() {
                         let chunk_end = std::cmp::min(offset + CHUNK_SIZE, content_bytes.len());
                         let chunk = &content_bytes[offset..chunk_end];
                         
-                        stream.write_all(chunk).await?;
+                        // Handle partial writes properly
+                        let mut written = 0;
+                        while written < chunk.len() {
+                            match stream.write(&chunk[written..]).await {
+                                Ok(n) => {
+                                    written += n;
+                                    if written < chunk.len() {
+                                        // Partial write, flush and continue
+                                        stream.flush().await?;
+                                    }
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    // Would block, flush and retry
+                                    stream.flush().await?;
+                                    continue;
+                                }
+                                Err(e) => return Err(e.into()),
+                            }
+                        }
                         
                         offset = chunk_end;
                     }
@@ -1777,29 +1807,38 @@ impl OnDemandHttpsServer {
                         content_length
                     );
                     
-                    // Write response with retry mechanism for large files
-                    let mut response = response_headers;
-                    response.push_str(&String::from_utf8_lossy(&processed_content));
-                    let response_bytes = response.as_bytes();
+                    // Write headers first
+                    conn.writer().write_all(response_headers.as_bytes())?;
+                    conn.write_tls(stream)?;
                     
-                    // Write response with retry mechanism
-                    let mut written = 0;
-                    while written < response_bytes.len() {
-                        match conn.writer().write(&response_bytes[written..]) {
-                            Ok(n) => {
-                                written += n;
-                                if written < response_bytes.len() {
-                                    // Partial write, try to flush and continue
-                                    conn.write_tls(stream)?;
+                    // Write content in chunks with proper partial write handling
+                    const CHUNK_SIZE: usize = 8192; // 8KB chunks
+                    let mut offset = 0;
+                    while offset < processed_content.len() {
+                        let chunk_end = std::cmp::min(offset + CHUNK_SIZE, processed_content.len());
+                        let chunk = &processed_content[offset..chunk_end];
+                        
+                        // Handle partial writes properly
+                        let mut written = 0;
+                        while written < chunk.len() {
+                            match conn.writer().write(&chunk[written..]) {
+                                Ok(n) => {
+                                    written += n;
+                                    if written < chunk.len() {
+                                        // Partial write, try to flush and continue
+                                        conn.write_tls(stream)?;
+                                    }
                                 }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    // Would block, try to flush and retry
+                                    conn.write_tls(stream)?;
+                                    continue;
+                                }
+                                Err(e) => return Err(e.into()),
                             }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                // Would block, try to flush and retry
-                                conn.write_tls(stream)?;
-                                continue;
-                            }
-                            Err(e) => return Err(e.into()),
                         }
+                        
+                        offset = chunk_end;
                     }
                     
                     // Final flush and complete I/O
@@ -1940,29 +1979,38 @@ impl OnDemandHttpsServer {
                 // Successfully served a file
                 match self.secure_file_server.generate_http_response(request_path, file_content.as_slice()) {
                     Ok(response_headers) => {
-                        // Write response with retry mechanism for large files
-                        let mut response = response_headers;
-                        response.push_str(&String::from_utf8_lossy(&file_content));
-                        let response_bytes = response.as_bytes();
+                        // Write headers first
+                        conn.writer().write_all(response_headers.as_bytes())?;
+                        conn.write_tls(stream)?;
                         
-                        // Write response with retry mechanism
-                        let mut written = 0;
-                        while written < response_bytes.len() {
-                            match conn.writer().write(&response_bytes[written..]) {
-                                Ok(n) => {
-                                    written += n;
-                                    if written < response_bytes.len() {
-                                        // Partial write, try to flush and continue
-                                        conn.write_tls(stream)?;
+                        // Write content in chunks with proper partial write handling
+                        const CHUNK_SIZE: usize = 8192; // 8KB chunks
+                        let mut offset = 0;
+                        while offset < file_content.len() {
+                            let chunk_end = std::cmp::min(offset + CHUNK_SIZE, file_content.len());
+                            let chunk = &file_content[offset..chunk_end];
+                            
+                            // Handle partial writes properly
+                            let mut written = 0;
+                            while written < chunk.len() {
+                                match conn.writer().write(&chunk[written..]) {
+                                    Ok(n) => {
+                                        written += n;
+                                        if written < chunk.len() {
+                                            // Partial write, try to flush and continue
+                                            conn.write_tls(stream)?;
+                                        }
                                     }
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                        // Would block, try to flush and retry
+                                        conn.write_tls(stream)?;
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e.into()),
                                 }
-                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                    // Would block, try to flush and retry
-                                    conn.write_tls(stream)?;
-                                    continue;
-                                }
-                                Err(e) => return Err(e.into()),
                             }
+                            
+                            offset = chunk_end;
                         }
                         
                         // Final flush and complete I/O
@@ -2541,10 +2589,18 @@ fn detect_server_ips() -> Result<Vec<IpAddr>, Box<dyn std::error::Error>> {
     for interface in interfaces {
         match interface.addr {
             IfAddr::V4(ipv4) => {
-                ip_addresses.push(IpAddr::V4(ipv4.ip));
+                let ip = ipv4.ip;
+                // Filter out localhost and loopback addresses
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    ip_addresses.push(IpAddr::V4(ip));
+                }
             }
             IfAddr::V6(ipv6) => {
-                ip_addresses.push(IpAddr::V6(ipv6.ip));
+                let ip = ipv6.ip;
+                // Filter out localhost and loopback addresses
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    ip_addresses.push(IpAddr::V6(ip));
+                }
             }
         }
     }
