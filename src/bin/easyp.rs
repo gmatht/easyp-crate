@@ -1546,7 +1546,7 @@ impl OnDemandHttpsServer {
                 return Err("Timeout waiting for HTTP request".into());
             }
             
-            println!("🔍 Attempting to read data for domain: {} (total_read: {}, attempt: {})", server_name, total_read, read_attempts);
+            //println!("🔍 Attempting to read data for domain: {} (total_read: {}, attempt: {})", server_name, total_read, read_attempts);
             
             // First, try to complete any pending TLS I/O
             match conn.complete_io(stream) {
@@ -1590,7 +1590,7 @@ impl OnDemandHttpsServer {
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    println!("🔍 TLS I/O WouldBlock for domain: {}, waiting... (attempt {})", server_name, read_attempts);
+                    //println!("🔍 TLS I/O WouldBlock for domain: {}, waiting... (attempt {})", server_name, read_attempts);
                     // No data available, wait a bit
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     continue;
@@ -2418,6 +2418,7 @@ fn ensure_acme_cache_directory(cache_dir: &str, uid: u32, gid: u32) -> Result<()
     
     // Create the acme_lib subdirectory
     let acme_lib_dir = format!("{}/acme_lib", cache_dir);
+    //TODO
     std::fs::create_dir_all(&acme_lib_dir)?;
     
     // Set ownership to www-data for both directories

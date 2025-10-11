@@ -1,6 +1,6 @@
 [package]
 name = "easyp-server"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.83"
 license = "Apache-2.0 OR ISC OR MIT"
@@ -18,7 +18,7 @@ path = "src/bin/easyp.rs"
 
 
 [features]
-default = ["acme", "extensions", "crypto-aws"]
+default = ["acme", "extensions", "crypto-ring"]
 acme = ["rustls-acme", "rcgen", "rustls-pemfile"]
 extensions = []
 # Crypto backend selection (choose one):
