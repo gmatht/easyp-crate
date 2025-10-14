@@ -2579,32 +2579,46 @@ fn get_www_data_uid_gid() -> Result<(u32, u32), Box<dyn std::error::Error>> {
 
 /// Automatically detect the server's IP addresses from network interfaces
 fn detect_server_ips() -> Result<Vec<IpAddr>, Box<dyn std::error::Error>> {
-    use get_if_addrs::{get_if_addrs, IfAddr};
+    #[cfg(target_os = "redox")]
+    {
+        // TODO: Implement proper network interface detection for Redox
+        // For now, accept all IPs on Redox as a fallback
+        println!("Redox detected: accepting all IP addresses (TODO: implement proper network interface detection)");
+        return Ok(vec![
+            IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), // 0.0.0.0 - all IPv4
+            IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), // :: - all IPv6
+        ]);
+    }
     
-    let interfaces = get_if_addrs()?;
-    let mut ip_addresses = Vec::new();
-    
-    for interface in interfaces {
-        match interface.addr {
-            IfAddr::V4(ipv4) => {
-                let ip = ipv4.ip;
-                // Filter out localhost and loopback addresses
-                if !ip.is_loopback() && !ip.is_unspecified() {
-                    ip_addresses.push(IpAddr::V4(ip));
+    #[cfg(not(target_os = "redox"))]
+    {
+        use get_if_addrs::{get_if_addrs, IfAddr};
+        
+        let interfaces = get_if_addrs()?;
+        let mut ip_addresses = Vec::new();
+        
+        for interface in interfaces {
+            match interface.addr {
+                IfAddr::V4(ipv4) => {
+                    let ip = ipv4.ip;
+                    // Filter out localhost and loopback addresses
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        ip_addresses.push(IpAddr::V4(ip));
+                    }
                 }
-            }
-            IfAddr::V6(ipv6) => {
-                let ip = ipv6.ip;
-                // Filter out localhost and loopback addresses
-                if !ip.is_loopback() && !ip.is_unspecified() {
-                    ip_addresses.push(IpAddr::V6(ip));
+                IfAddr::V6(ipv6) => {
+                    let ip = ipv6.ip;
+                    // Filter out localhost and loopback addresses
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        ip_addresses.push(IpAddr::V6(ip));
+                    }
                 }
             }
         }
+        
+        println!("Detected {} IP addresses: {:?}", ip_addresses.len(), ip_addresses);
+        Ok(ip_addresses)
     }
-    
-    println!("Detected {} IP addresses: {:?}", ip_addresses.len(), ip_addresses);
-    Ok(ip_addresses)
 }
 
 /// Parse comma-separated IP addresses
