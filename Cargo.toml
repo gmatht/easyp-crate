@@ -19,7 +19,7 @@ path = "src/bin/easyp.rs"
 
 [features]
 default = ["acme", "extensions", "crypto-ring"]
-acme = ["rustls-acme", "rcgen", "rustls-pemfile"]
+acme = ["rustls-acme"]
 extensions = []
 # Crypto backend selection (choose one):
 crypto-ring = ["rcgen/ring"]        # Lighter (~4-5MB binary), ECDSA only, Safari compatible
@@ -44,21 +44,23 @@ tokio = { version = "1.34", features = ["io-util", "macros", "net", "rt", "rt-mu
 # Logging
 log = "0.4"
 
-
-# Network
-[target.'cfg(not(target_os = "redox"))'.dependencies]
-get_if_addrs = "0.5"
-
-# System dependencies
-libc = "0.2"
-
-# URL encoding
 urlencoding = "2.1"
 
-
 # Certificate generation and parsing
-rcgen = { version = "0.14", optional = true }
-rustls-pemfile = { version = "2.2", optional = true }
+rcgen = { path = "../rcgen/rcgen", features = ["pem", "ring"], default-features = false }
+#rcgen = { workspace = true }
+#rustls-pemfile = { workspace = true }
+rustls-pemfile = { version = "2.2" }
+
+# Dependencies not available on Redox
+[target.'cfg(not(target_os = "redox"))'.dependencies]
+get_if_addrs = "0.5"
+libc = "0.2"
+
+[target.'cfg(target_os = "redox")'.dependencies]
+libc = "0.2"
+
+
 
 [profile.release]
 opt-level = "z"  # Optimize for size
