@@ -6,7 +6,7 @@
 set -e  # Exit on any error
 
 STAGING=--staging
-STAGING=
+#STAGING=
 PROFILE=lto
 		  
 KEEPALIVE=y
