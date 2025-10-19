@@ -1109,16 +1109,14 @@ impl OnDemandHttpsServer {
                 }
                 Err(e) => {
                     let error_msg = format!("Error: {}", e);
-                    let error_response = format!(
-                        "HTTP/1.1 500 Internal Server Error\r\n\
-                         Content-Type: text/plain\r\n\
-                         Content-Length: {}\r\n\
-                         \r\n\
-                         {}",
-                        error_msg.len(),
-                        error_msg
-                    );
-                    stream.write_all(error_response.as_bytes()).await?;
+
+                    // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTP)
+                    let mut response = HttpResponse::internal_server_error(error_msg.as_bytes().to_vec());
+                    response.set_content_type("text/plain");
+                    response.set_content_length();
+
+                    let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTP
+                    stream.write_all(&response_bytes).await?;
                     stream.flush().await?;
                     return Ok(());
                 }
@@ -1191,16 +1189,15 @@ impl OnDemandHttpsServer {
                         return Ok(());
                     }
                     Err(e) => {
-                        let error_response = format!(
-                            "HTTP/1.1 500 Internal Server Error\r\n\
-                             Content-Type: text/plain\r\n\
-                             Content-Length: {}\r\n\
-                             \r\n\
-                             Error: {}",
-                            e.to_string().len(),
-                            e
-                        );
-                        stream.write_all(error_response.as_bytes()).await?;
+                        let error_msg = format!("Error: {}", e);
+
+                        // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTP)
+                        let mut response = HttpResponse::internal_server_error(error_msg.as_bytes().to_vec());
+                        response.set_content_type("text/plain");
+                        response.set_content_length();
+
+                        let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTP
+                        stream.write_all(&response_bytes).await?;
                         stream.flush().await?;
                         return Ok(());
                     }
@@ -1452,13 +1449,44 @@ impl OnDemandHttpsServer {
             }
         };
 
-        // Handle the connection
-        println!("🔍 About to call process_https_request_static for domain: {}", server_name);
-        Self::process_https_request_static_blocking(&mut stream, &mut conn, &server_name, &extension_registry, &http_challenges, &secure_file_server)?;
-        println!("🔍 process_https_request_static completed for domain: {}", server_name);
+        // Handle the connection with Keep-Alive support
+        println!("🔍 Starting HTTPS Keep-Alive loop for domain: {}", server_name);
+
+        let connection_policy = ConnectionPolicy::default();
+        let mut request_count = 0;
+
+        loop {
+            request_count += 1;
+
+            println!("🔍 Processing HTTPS request {} for domain: {}", request_count, server_name);
+
+            // Process the request and get parsed version/connection info
+            let (http_version, connection_header) = Self::process_https_request_static_blocking(&mut stream, &mut conn, &server_name, &extension_registry, &http_challenges, &secure_file_server)?;
+
+            // Determine if we should keep the connection alive
+            let should_keep_alive = connection_policy.should_keep_alive(
+                &http_version,
+                connection_header.as_deref(),
+                0, // We don't have response size here, but it's not critical for the decision
+                request_count,
+            );
+
+            println!("🔍 HTTPS request {} completed (version: {}, keep_alive: {})",
+                request_count, http_version, should_keep_alive);
+
+            if !should_keep_alive {
+                println!("DEBUG: Closing HTTPS connection after {} requests (version: {})",
+                    request_count, http_version);
+                break; // Exit the Keep-Alive loop
+            }
+
+            println!("DEBUG: Keeping HTTPS connection alive for next request (version: {})",
+                http_version);
+        }
 
         Ok(())
     }
+
 
     /// Handle a single HTTPS connection
 
@@ -1528,16 +1556,15 @@ impl OnDemandHttpsServer {
                 Ok(())
             }
             Err(e) => {
-                let error_response = format!(
-                    "HTTP/1.1 500 Internal Server Error\r\n\
-                     Content-Type: text/plain\r\n\
-                     Content-Length: {}\r\n\
-                     \r\n\
-                     Error: {}",
-                    e.to_string().len(),
-                    e
-                );
-                conn.writer().write_all(error_response.as_bytes())?;
+                let error_msg = format!("Error: {}", e);
+
+                // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTPS)
+                let mut response = HttpResponse::internal_server_error(error_msg.as_bytes().to_vec());
+                response.set_content_type("text/plain");
+                response.set_content_length();
+
+                let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTPS
+                conn.writer().write_all(&response_bytes)?;
                 conn.write_tls(stream)?;
                 conn.complete_io(stream)?;
                 Ok(())
@@ -1553,7 +1580,7 @@ impl OnDemandHttpsServer {
         extension_registry: &Arc<Mutex<ExtensionRegistry>>,
         http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
         secure_file_server: &SecureFileServer,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(HttpVersion, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
         println!("🔍 process_https_request_static started for domain: {}", server_name);
         // TLS handshake is already completed in the main connection handler
         println!("🔍 TLS handshake already completed for domain: {}", server_name);
@@ -1639,6 +1666,9 @@ impl OnDemandHttpsServer {
         // Parse HTTP request (simplified)
         let request = String::from_utf8_lossy(&buffer[..n]);
         let lines: Vec<&str> = request.lines().collect();
+
+        // Parse HTTP version and connection header for Keep-Alive support
+        let (http_version, connection_header) = ConnectionPolicy::parse_request_info(&request);
 
         if let Some(first_line) = lines.first() {
             println!("HTTP Request: {}", first_line);
@@ -1730,16 +1760,15 @@ impl OnDemandHttpsServer {
                     return Ok(());
                 }
                 Err(e) => {
-                    let error_response = format!(
-                        "HTTP/1.1 500 Internal Server Error\r\n\
-                         Content-Type: text/plain\r\n\
-                         Content-Length: {}\r\n\
-                         \r\n\
-                         Error: {}",
-                        e.to_string().len(),
-                        e
-                    );
-                    conn.writer().write_all(error_response.as_bytes())?;
+                    let error_msg = format!("Error: {}", e);
+
+                    // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTPS)
+                    let mut response = HttpResponse::internal_server_error(error_msg.as_bytes().to_vec());
+                    response.set_content_type("text/plain");
+                    response.set_content_length();
+
+                    let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTPS
+                    conn.writer().write_all(&response_bytes)?;
                     conn.write_tls(stream)?;
                     conn.complete_io(stream)?;
                     return Ok(());
@@ -1792,57 +1821,17 @@ impl OnDemandHttpsServer {
 
                     // Generate HTTP response with proper MIME type
                     let mime_type = secure_file_server.get_mime_type(&file_path_for_mime);
-                    let content_length = processed_content.len();
 
-                    let response_headers = format!(
-                        "HTTP/1.1 200 OK\r\n\
-                         Content-Type: {}\r\n\
-                         Content-Length: {}\r\n\
-                         X-Content-Type-Options: nosniff\r\n\
-                         X-Frame-Options: DENY\r\n\
-                         X-XSS-Protection: 1; mode=block\r\n\
-                         Cache-Control: no-cache\r\n\
-                         Connection: close\r\n\
-                         \r\n",
-                        mime_type,
-                        content_length
-                    );
+                    // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTPS)
+                    let mut response = HttpResponse::ok(processed_content.clone());
+                    response.set_content_type(&mime_type);
+                    response.set_content_length();
+                    response.add_security_headers();
 
-                    // Write headers first
-                    conn.writer().write_all(response_headers.as_bytes())?;
-                    conn.write_tls(stream)?;
+                    let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTPS
 
-                    // Write content in chunks with proper partial write handling
-                    const CHUNK_SIZE: usize = 8192; // 8KB chunks
-                    let mut offset = 0;
-                    while offset < processed_content.len() {
-                        let chunk_end = std::cmp::min(offset + CHUNK_SIZE, processed_content.len());
-                        let chunk = &processed_content[offset..chunk_end];
-
-                        // Handle partial writes properly
-                        let mut written = 0;
-                        while written < chunk.len() {
-                            match conn.writer().write(&chunk[written..]) {
-                                Ok(n) => {
-                                    written += n;
-                                    if written < chunk.len() {
-                                        // Partial write, try to flush and continue
-                                        conn.write_tls(stream)?;
-                                    }
-                                }
-                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                    // Would block, try to flush and retry
-                                    conn.write_tls(stream)?;
-                                    continue;
-                                }
-                                Err(e) => return Err(e.into()),
-                            }
-                        }
-
-                        offset = chunk_end;
-                    }
-
-                    // Final flush and complete I/O
+                    // Write complete response (headers + content)
+                    conn.writer().write_all(&response_bytes)?;
                     conn.write_tls(stream)?;
                     conn.complete_io(stream)?;
                 }
@@ -1852,18 +1841,15 @@ impl OnDemandHttpsServer {
                 if secure_file_server.is_root_request(request_path) {
                     // Serve default informational page
                     let default_page = secure_file_server.generate_default_page(server_name);
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\n\
-                         Content-Type: text/html; charset=utf-8\r\n\
-                         Content-Length: {}\r\n\
-                         Connection: close\r\n\
-                         \r\n\
-                         {}",
-                        default_page.len(),
-                        default_page
-                    );
 
-                    conn.writer().write_all(response.as_bytes())?;
+                    // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTPS)
+                    let mut response = HttpResponse::ok(default_page.as_bytes().to_vec());
+                    response.set_content_type("text/html; charset=utf-8");
+                    response.set_content_length();
+                    response.add_security_headers();
+
+                    let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTPS
+                    conn.writer().write_all(&response_bytes)?;
                     conn.write_tls(stream)?;
                     conn.complete_io(stream)?;
                 } else {
@@ -1877,18 +1863,15 @@ impl OnDemandHttpsServer {
                 if secure_file_server.is_root_request(request_path) {
                     // Serve default informational page even for security errors on root
                     let default_page = secure_file_server.generate_default_page(server_name);
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\n\
-                         Content-Type: text/html; charset=utf-8\r\n\
-                         Content-Length: {}\r\n\
-                         Connection: close\r\n\
-                         \r\n\
-                         {}",
-                        default_page.len(),
-                        default_page
-                    );
 
-                    conn.writer().write_all(response.as_bytes())?;
+                    // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTPS)
+                    let mut response = HttpResponse::ok(default_page.as_bytes().to_vec());
+                    response.set_content_type("text/html; charset=utf-8");
+                    response.set_content_length();
+                    response.add_security_headers();
+
+                    let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTPS
+                    conn.writer().write_all(&response_bytes)?;
                     conn.write_tls(stream)?;
                     conn.complete_io(stream)?;
                 } else {
@@ -1898,7 +1881,7 @@ impl OnDemandHttpsServer {
             }
         }
 
-        Ok(())
+        Ok((http_version, connection_header))
     }
 
     /// Process HTTPS request and send response
@@ -2065,17 +2048,13 @@ impl OnDemandHttpsServer {
             status_code, status_text, status_code, status_text
         );
 
-        let response = format!(
-            "HTTP/1.1 {} {}\r\n\
-             Content-Type: text/html; charset=utf-8\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {}",
-            status_code, status_text, body.len(), body
-        );
+        // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTPS)
+        let mut response = HttpResponse::new(status_code, status_text, body.as_bytes().to_vec());
+        response.set_content_type("text/html; charset=utf-8");
+        response.set_content_length();
 
-        conn.writer().write_all(response.as_bytes())?;
+        let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTPS
+        conn.writer().write_all(&response_bytes)?;
         conn.write_tls(stream)?;
         conn.complete_io(stream)?;
 
@@ -2109,17 +2088,13 @@ impl OnDemandHttpsServer {
             status_code, status_text, status_code, status_text
         );
 
-        let response = format!(
-            "HTTP/1.1 {} {}\r\n\
-             Content-Type: text/html; charset=utf-8\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {}",
-            status_code, status_text, body.len(), body
-        );
+        // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTPS)
+        let mut response = HttpResponse::new(status_code, status_text, body.as_bytes().to_vec());
+        response.set_content_type("text/html; charset=utf-8");
+        response.set_content_length();
 
-        conn.writer().write_all(response.as_bytes())?;
+        let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTPS
+        conn.writer().write_all(&response_bytes)?;
         conn.write_tls(stream)?;
         conn.complete_io(stream)?;
 
@@ -2145,30 +2120,28 @@ impl OnDemandHttpsServer {
 
         let response = if let Some(key_auth) = key_authorization {
             println!("Serving challenge response for token: {}", token);
-            format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: text/plain\r\n\
-                 Content-Length: {}\r\n\
-                 Cache-Control: no-cache\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 {}",
-                key_auth.len(),
-                key_auth
-            )
+
+            // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTP)
+            let mut response = HttpResponse::ok(key_auth.as_bytes().to_vec());
+            response.set_content_type("text/plain");
+            response.set_content_length();
+            response.set_cache_control("no-cache");
+
+            let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTP
+            response_bytes
         } else {
             println!("Challenge token not found: {}", token);
-            format!(
-                "HTTP/1.1 404 Not Found\r\n\
-                 Content-Type: text/plain\r\n\
-                 Content-Length: 13\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 Not Found"
-            )
+
+            // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTP)
+            let mut response = HttpResponse::not_found(b"Not Found".to_vec());
+            response.set_content_type("text/plain");
+            response.set_content_length();
+
+            let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTP
+            response_bytes
         };
 
-        stream.write_all(response.as_bytes()).await?;
+        stream.write_all(&response).await?;
         stream.flush().await?;
 
         Ok(())
@@ -2194,30 +2167,28 @@ impl OnDemandHttpsServer {
 
         let response = if let Some(key_auth) = key_authorization {
             println!("Serving challenge response for token: {}", token);
-            format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: text/plain\r\n\
-                 Content-Length: {}\r\n\
-                 Cache-Control: no-cache\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 {}",
-                key_auth.len(),
-                key_auth
-            )
+
+            // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTPS)
+            let mut response = HttpResponse::ok(key_auth.as_bytes().to_vec());
+            response.set_content_type("text/plain");
+            response.set_content_length();
+            response.set_cache_control("no-cache");
+
+            let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTPS
+            response_bytes
         } else {
             println!("Challenge token not found: {}", token);
-            format!(
-                "HTTP/1.1 404 Not Found\r\n\
-                 Content-Type: text/plain\r\n\
-                 Content-Length: 13\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 Not Found"
-            )
+
+            // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTPS)
+            let mut response = HttpResponse::not_found(b"Not Found".to_vec());
+            response.set_content_type("text/plain");
+            response.set_content_length();
+
+            let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTPS
+            response_bytes
         };
 
-        conn.writer().write_all(response.as_bytes())?;
+        conn.writer().write_all(&response)?;
         conn.write_tls(stream)?;
         conn.complete_io(stream)?;
 
@@ -2244,30 +2215,28 @@ impl OnDemandHttpsServer {
 
         let response = if let Some(key_auth) = key_authorization {
             println!("Serving challenge response for token: {}", token);
-            format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: text/plain\r\n\
-                 Content-Length: {}\r\n\
-                 Cache-Control: no-cache\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 {}",
-                key_auth.len(),
-                key_auth
-            )
+
+            // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTPS)
+            let mut response = HttpResponse::ok(key_auth.as_bytes().to_vec());
+            response.set_content_type("text/plain");
+            response.set_content_length();
+            response.set_cache_control("no-cache");
+
+            let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTPS
+            response_bytes
         } else {
             println!("Challenge token not found: {}", token);
-            format!(
-                "HTTP/1.1 404 Not Found\r\n\
-                 Content-Type: text/plain\r\n\
-                 Content-Length: 13\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 Not Found"
-            )
+
+            // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTPS)
+            let mut response = HttpResponse::not_found(b"Not Found".to_vec());
+            response.set_content_type("text/plain");
+            response.set_content_length();
+
+            let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTPS
+            response_bytes
         };
 
-        conn.writer().write_all(response.as_bytes())?;
+        conn.writer().write_all(&response)?;
         conn.write_tls(stream)?;
         conn.complete_io(stream)?;
 
