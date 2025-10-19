@@ -1,73 +1,63 @@
-//! Simple CGI environment utilities
-
+// cgi_env.rs - Minimal CGI environment for extensions
 use std::collections::HashMap;
 
-/// Simple CGI environment structure
+#[derive(Debug)]
 pub struct CgiEnv {
+    pub request_uri: String,
     pub query_string: String,
-    pub request_method: String,
-    pub content_length: Option<usize>,
-    pub content_type: Option<String>,
+    pub method: String,
+    pub host: String,
     pub headers: HashMap<String, String>,
 }
 
 impl CgiEnv {
-    pub fn new() -> Self {
+    pub fn from_request(
+        method: &str,
+        uri: &str,
+        host: &str,
+        query_string: &str,
+        headers: &HashMap<String, String>,
+    ) -> Self {
         Self {
-            query_string: String::new(),
-            request_method: String::new(),
-            content_length: None,
-            content_type: None,
-            headers: HashMap::new(),
+            request_uri: uri.to_string(),
+            query_string: query_string.to_string(),
+            method: method.to_string(),
+            host: host.to_string(),
+            headers: headers.clone(),
         }
-    }
-
-    pub fn from_request(method: &str, uri: &str, host: &str, query_string: &str, headers: &HashMap<String, String>) -> Self {
-        let mut env = Self::new();
-        env.request_method = method.to_string();
-        env.query_string = query_string.to_string();
-        env.headers = headers.clone();
-        env
     }
 
     pub fn parse_query(&self) -> HashMap<String, String> {
         let mut params = HashMap::new();
         for pair in self.query_string.split('&') {
-            if let Some(eq_pos) = pair.find('=') {
-                let key = url_decode(&pair[..eq_pos]);
-                let value = url_decode(&pair[eq_pos + 1..]);
-                params.insert(key, value);
+            if let Some((key, value)) = pair.split_once('=') {
+                params.insert(key.to_string(), value.to_string());
             }
         }
         params
     }
 }
 
-/// URL decode a string
 pub fn url_decode(s: &str) -> String {
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-    
-    while let Some(ch) = chars.next() {
-        if ch == '+' {
-            result.push(' ');
-        } else if ch == '%' {
-            if let (Some(c1), Some(c2)) = (chars.next(), chars.next()) {
-                let hex = format!("{}{}", c1, c2);
-                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                    result.push(char::from(byte));
-                } else {
-                    result.push('%');
-                    result.push(c1);
-                    result.push(c2);
-                }
-            } else {
-                result.push('%');
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    
-    result
+    // Simple URL decoding - replace %20 with space, etc.
+    s.replace("%20", " ")
+     .replace("%21", "!")
+     .replace("%22", "\"")
+     .replace("%23", "#")
+     .replace("%24", "$")
+     .replace("%25", "%")
+     .replace("%26", "&")
+     .replace("%27", "'")
+     .replace("%28", "(")
+     .replace("%29", ")")
+     .replace("%2B", "+")
+     .replace("%2C", ",")
+     .replace("%2F", "/")
+     .replace("%3A", ":")
+     .replace("%3B", ";")
+     .replace("%3C", "<")
+     .replace("%3D", "=")
+     .replace("%3E", ">")
+     .replace("%3F", "?")
+     .replace("%40", "@")
 }
