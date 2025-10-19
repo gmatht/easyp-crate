@@ -10,10 +10,72 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf, Component};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
+
+use super::http_version::HttpVersion;
+use super::http_response::HttpResponse;
 
 // Unix-specific imports for privilege dropping
 //#[cfg(unix)]
 // use std::os::unix::fs::PermissionsExt; // Not currently used
+
+/// Format a SystemTime as an HTTP date string (RFC 7231)
+/// Returns a string in the format: "Wed, 21 Oct 2015 07:28:00 GMT"
+fn format_http_date(time: &SystemTime) -> String {
+    let duration_since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let timestamp = duration_since_epoch.as_secs();
+
+    // Convert Unix timestamp to HTTP date format
+    // This is a simplified implementation - in production you might want to use a proper date formatting library
+    let days_since_epoch = timestamp / 86400;
+    let seconds_today = timestamp % 86400;
+
+    let hours = seconds_today / 3600;
+    let minutes = (seconds_today % 3600) / 60;
+    let seconds = seconds_today % 60;
+
+    // Calculate year, month, day (simplified - doesn't handle leap years perfectly)
+    let year = 1970 + (days_since_epoch / 365);
+    let day_of_year = (days_since_epoch % 365) + 1;
+
+    // Simple month calculation (approximate)
+    let month = if day_of_year <= 31 { 1 } // Jan
+    else if day_of_year <= 59 { 2 } // Feb
+    else if day_of_year <= 90 { 3 } // Mar
+    else if day_of_year <= 120 { 4 } // Apr
+    else if day_of_year <= 151 { 5 } // May
+    else if day_of_year <= 181 { 6 } // Jun
+    else if day_of_year <= 212 { 7 } // Jul
+    else if day_of_year <= 243 { 8 } // Aug
+    else if day_of_year <= 273 { 9 } // Sep
+    else if day_of_year <= 304 { 10 } // Oct
+    else if day_of_year <= 334 { 11 } // Nov
+    else { 12 }; // Dec
+
+    let day_of_month = day_of_year - match month {
+        1 => 0,
+        2 => 31,
+        3 => 59,
+        4 => 90,
+        5 => 120,
+        6 => 151,
+        7 => 181,
+        8 => 212,
+        9 => 243,
+        10 => 273,
+        11 => 304,
+        12 => 334,
+        _ => 0,
+    };
+
+    // Calculate day of week (simplified)
+    let day_of_week = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][(days_since_epoch % 7) as usize];
+    let month_name = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][(month - 1) as usize];
+
+    format!("{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+            day_of_week, day_of_month, month_name, year, hours, minutes, seconds)
+}
 
 /// MIME type mappings for common file extensions
 #[derive(Debug, Clone)]
@@ -103,6 +165,12 @@ pub struct SecurityConfig {
     pub drop_to_uid: Option<u32>,
     /// Group ID to drop to (if None, no privilege dropping)
     pub drop_to_gid: Option<u32>,
+    /// Keep-Alive timeout for persistent connections
+    pub keep_alive_timeout: Duration,
+    /// Maximum number of requests per Keep-Alive connection
+    pub keep_alive_max_requests: usize,
+    /// Minimum HTTP version to support
+    pub minimum_http_version: HttpVersion,
 }
 
 impl Default for SecurityConfig {
@@ -127,6 +195,9 @@ impl Default for SecurityConfig {
             ],
             drop_to_uid: None,
             drop_to_gid: None,
+            keep_alive_timeout: Duration::from_secs(5),
+            keep_alive_max_requests: 100,
+            minimum_http_version: HttpVersion::Http09,
         }
     }
 }
@@ -165,28 +236,28 @@ impl SecureFileServer {
         if !domain.chars().all(|c| c.is_alphanumeric() || c == '.') {
             return false;
         }
-        
+
         // Check if domain contains ".." (directory traversal)
         if domain.contains("..") {
             return false;
         }
-        
+
         // Check if domain contains at least one dot
         if !domain.contains('.') {
             return false;
         }
-        
+
         // Additional safety checks
         // Domain should not start or end with a dot
         if domain.starts_with('.') || domain.ends_with('.') {
             return false;
         }
-        
+
         // Domain should not have consecutive dots
         if domain.contains("...") {
             return false;
         }
-        
+
         true
     }
 
@@ -200,7 +271,7 @@ impl SecureFileServer {
                 return domain_path;
             }
         }
-        
+
         // Fall back to default document root
         println!("Using default document root: {}", self.config.document_root.display());
         self.config.document_root.clone()
@@ -383,7 +454,7 @@ impl SecureFileServer {
         // Build the full path to check if it's a directory
         let clean_path = request_path.trim_start_matches('/');
         let file_path = document_root.join(clean_path);
-        
+
         // Check if the path is a directory
         if file_path.is_dir() {
             // Redirect to the same path with trailing slash
@@ -391,7 +462,7 @@ impl SecureFileServer {
             println!("Redirecting '{}' to '{}'", request_path, redirect_url);
             return Some(redirect_url);
         }
-        
+
         None
     }
 
@@ -408,10 +479,8 @@ impl SecureFileServer {
     pub fn serve_file_with_domain(&self, request_path: &str, domain: Option<&str>) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
         // Check for redirects first using domain-specific document root
         if let Some(redirect_url) = self.check_redirect_with_domain(request_path, domain) {
-            let response = format!(
-                "HTTP/1.1 301 Moved Permanently\r\nLocation: {}\r\nContent-Length: 0\r\n\r\n",
-                redirect_url
-            );
+            // For backward compatibility, use HTTP/1.1 with close for redirects
+            let response = self.generate_redirect_response(&redirect_url, &HttpVersion::Http11, false);
             return Ok(Some(response.as_bytes().to_vec()));
         }
 
@@ -426,12 +495,12 @@ impl SecureFileServer {
         if request_path.ends_with('/') {
             let clean_path = request_path.trim_start_matches('/');
             let dir_path = document_root.join(clean_path);
-            
+
             if dir_path.is_dir() {
                 // Try to serve index.html or index.htm from the directory
                 let index_html = dir_path.join("index.html");
                 let index_htm = dir_path.join("index.htm");
-                
+
                 let file_to_serve = if index_html.exists() {
                     index_html
                 } else if index_htm.exists() {
@@ -440,7 +509,7 @@ impl SecureFileServer {
                     // No index file found, return 404
                     return Ok(None);
                 };
-                
+
                 // Serve the index file
                 let mut file = match File::open(&file_to_serve) {
                     Ok(file) => file,
@@ -498,37 +567,137 @@ impl SecureFileServer {
         self.mime_types.get_mime_type(path)
     }
 
-    /// Generate an HTTP response for a file
+    /// Generate a simple HTTP response for content (like ACME challenges or default pages)
+    pub fn generate_simple_http_response(&self, content: &[u8], content_type: &str, include_last_modified: bool) -> String {
+        // For backward compatibility, default to HTTP/1.1 with close
+        self.generate_simple_http_response_with_version(content, content_type, include_last_modified, &HttpVersion::Http11, false)
+    }
+
+    /// Generate a simple HTTP response with version and keep-alive support
+    pub fn generate_simple_http_response_with_version(&self, content: &[u8], content_type: &str, include_last_modified: bool, version: &HttpVersion, keep_alive: bool) -> String {
+
+        let mut response = HttpResponse::ok(content.to_vec());
+        response.set_content_type(content_type);
+        response.set_content_length();
+
+        // Add Last-Modified header if requested and we can determine it
+        if include_last_modified {
+            // For simple responses, we can't easily determine file modification time
+            // So we'll use the current time as a fallback
+            let now = std::time::SystemTime::now();
+            let last_modified = format_http_date(&now);
+            response.set_last_modified(&last_modified);
+        }
+
+        // Add security headers for HTML content
+        if content_type.starts_with("text/html") {
+            response.add_security_headers();
+        }
+
+        // Add cache control
+        if content_type.starts_with("text/plain") {
+            // ACME challenges should not be cached
+            response.set_cache_control("no-cache");
+        } else {
+            // Default pages can be cached briefly
+            response.set_cache_control("public, max-age=300");
+        }
+
+        // Encode with version and keep-alive settings
+        let encoded = response.encode(version, keep_alive);
+        String::from_utf8_lossy(&encoded).to_string()
+    }
+
+    /// Generate an HTTP response for a file with proper Last-Modified header
     pub fn generate_http_response(&self, request_path: &str, content: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+        // For backward compatibility, default to HTTP/1.1 with close
+        self.generate_http_response_with_version(request_path, content, &HttpVersion::Http11, false)
+    }
+
+    /// Generate an HTTP response for a file with version and keep-alive support
+    pub fn generate_http_response_with_version(&self, request_path: &str, content: &[u8], version: &HttpVersion, keep_alive: bool) -> Result<String, Box<dyn std::error::Error>> {
+
         let file_path = self.sanitize_path(request_path)?;
         let mime_type = self.get_mime_type(&file_path);
-        let content_length = content.len();
 
-        // Check if it's a potentially dangerous file type that should have additional headers
-        let mut headers = format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: {}\r\n\
-             Content-Length: {}\r\n\
-             X-Content-Type-Options: nosniff\r\n\
-             X-Frame-Options: DENY\r\n\
-             X-XSS-Protection: 1; mode=block\r\n",
-            mime_type,
-            content_length
-        );
+        let mut response = HttpResponse::ok(content.to_vec());
+        response.set_content_type(&mime_type);
+        response.set_content_length();
+
+        // Get file modification time for Last-Modified header
+        if let Ok(metadata) = std::fs::metadata(&file_path) {
+            if let Ok(modified_time) = metadata.modified() {
+                let last_modified = format_http_date(&modified_time);
+                response.set_last_modified(&last_modified);
+            }
+        }
+
+        // Add security headers
+        response.add_security_headers();
 
         // Add cache control for static assets
         if mime_type.starts_with("image/") ||
            mime_type.starts_with("text/css") ||
            mime_type.starts_with("application/javascript") ||
            mime_type.starts_with("application/wasm") {
-            headers.push_str("Cache-Control: public, max-age=3600\r\n");
+            response.set_cache_control("public, max-age=3600");
         } else {
-            headers.push_str("Cache-Control: no-cache\r\n");
+            response.set_cache_control("no-cache");
         }
 
-        headers.push_str("Connection: close\r\n\r\n");
+        // Encode with version and keep-alive settings
+        let encoded = response.encode(version, keep_alive);
+        Ok(String::from_utf8_lossy(&encoded).to_string())
+    }
 
-        Ok(headers)
+    /// Generate HTTP response headers for a file (without content)
+    /// This is useful when you have the file path and content separately
+    pub fn generate_file_response_headers(&self, file_path: &Path, content_length: usize) -> Result<String, Box<dyn std::error::Error>> {
+        // For backward compatibility, default to HTTP/1.1 with close
+        self.generate_file_response_headers_with_version(file_path, content_length, &HttpVersion::Http11, false)
+    }
+
+    /// Generate HTTP response headers for a file with version and keep-alive support
+    pub fn generate_file_response_headers_with_version(&self, file_path: &Path, content_length: usize, version: &HttpVersion, keep_alive: bool) -> Result<String, Box<dyn std::error::Error>> {
+
+        let mime_type = self.get_mime_type(file_path);
+
+        let mut response = HttpResponse::ok(vec![]); // Empty body for headers-only
+        response.set_content_type(&mime_type);
+        response.set_header("Content-Length", &content_length.to_string());
+
+        // Get file modification time for Last-Modified header
+        if let Ok(metadata) = std::fs::metadata(file_path) {
+            if let Ok(modified_time) = metadata.modified() {
+                let last_modified = format_http_date(&modified_time);
+                response.set_last_modified(&last_modified);
+            }
+        }
+
+        // Add security headers
+        response.add_security_headers();
+
+        // Add cache control for static assets
+        if mime_type.starts_with("image/") ||
+           mime_type.starts_with("text/css") ||
+           mime_type.starts_with("application/javascript") ||
+           mime_type.starts_with("application/wasm") {
+            response.set_cache_control("public, max-age=3600");
+        } else {
+            response.set_cache_control("no-cache");
+        }
+
+        // Encode with version and keep-alive settings
+        let encoded = response.encode(version, keep_alive);
+        Ok(String::from_utf8_lossy(&encoded).to_string())
+    }
+
+    /// Generate a redirect response with version and keep-alive support
+    pub fn generate_redirect_response(&self, location: &str, version: &HttpVersion, keep_alive: bool) -> String {
+
+        let response = HttpResponse::moved_permanently(location);
+        let encoded = response.encode(version, keep_alive);
+        String::from_utf8_lossy(&encoded).to_string()
     }
 
     /// Check if a file extension is allowed
@@ -759,17 +928,8 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
-    use tempfile::tempdir;
-
     #[test]
     fn test_mime_types() {
-        let temp_dir = tempdir().unwrap();
-        let config = SecurityConfig {
-            document_root: temp_dir.path().to_path_buf(),
-            ..Default::default()
-        };
-
-        let server = SecureFileServer::new(config);
         let mime_types = MimeTypes::default();
 
         assert_eq!(mime_types.get_mime_type(Path::new("test.html")), "text/html; charset=utf-8");

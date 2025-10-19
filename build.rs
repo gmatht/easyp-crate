@@ -10,7 +10,11 @@ fn sanitize_ident(stem: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    if s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    if s.chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
         s.insert(0, '_');
     }
     if s.is_empty() {
@@ -18,7 +22,6 @@ fn sanitize_ident(stem: &str) -> String {
     }
     s
 }
-
 
 fn main() -> std::io::Result<()> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -36,7 +39,10 @@ fn main() -> std::io::Result<()> {
             let entry = entry?;
             let path = entry.path();
             if path.is_file() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(name) = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                {
                     if name.ends_with(".expand.rs") {
                         let stem = &name[..name.len() - ".expand.rs".len()];
                         let ident = sanitize_ident(stem);
@@ -123,7 +129,7 @@ fn main() -> std::io::Result<()> {
     out.push_str("        // Process HTML with extensions using simple string operations\n");
     out.push_str("        let mut result = html.to_string();\n");
     out.push_str("        \n");
-    
+
     // Generate extension processing for each .expand.rs file found at build time
     for (ident, _filename) in &expand_entries {
         out.push_str(&format!(
@@ -154,7 +160,7 @@ fn main() -> std::io::Result<()> {
         out.push_str("        }\n");
         out.push_str("        \n");
     }
-    
+
     out.push_str("        result\n");
     out.push_str("    }\n\n");
 
@@ -166,22 +172,21 @@ fn main() -> std::io::Result<()> {
     out.push_str("        // Process admin request by checking for admin extensions\n");
     out.push_str("        for (ext_name, key) in &self.admin_keys {\n");
     out.push_str("            let admin_prefix = format!(\"/{}_\", ext_name);\n");
-    out.push_str("            println!(\"DEBUG: Checking prefix {} with key {}\", admin_prefix, key);\n");
+    out.push_str(
+        "            println!(\"DEBUG: Checking prefix {} with key {}\", admin_prefix, key);\n",
+    );
     out.push_str("            if path.starts_with(&admin_prefix) {\n");
     out.push_str("                // Dynamically call the appropriate admin handler\n");
     out.push_str("                let handler_name = format!(\"{}_admin::handle_{}_admin_request\", ext_name, ext_name);\n");
     out.push_str("                return match ext_name.as_str() {\n");
-    
+
     // Generate match arms for each .admin.rs file
     if let Ok(entries) = std::fs::read_dir("extensions") {
         for entry in entries.flatten() {
             if let Some(file_name) = entry.file_name().to_str() {
                 if file_name.ends_with(".admin.rs") {
                     let ext_name = file_name.replace(".admin.rs", "");
-                    out.push_str(&format!(
-                        "                    \"{}\" => {{\n",
-                        ext_name
-                    ));
+                    out.push_str(&format!("                    \"{}\" => {{\n", ext_name));
                     out.push_str(&format!(
                         "                        {}_admin::handle_{}_admin_request(path, method, query, body, headers, &self.admin_keys)\n",
                         ext_name, ext_name
@@ -192,7 +197,7 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
-    
+
     out.push_str("                    _ => {\n");
     out.push_str("                        Ok(r#\"{\\\"error\\\": \\\"Admin extension not found\\\"}\"#.to_string())\n");
     out.push_str("                    }\n");
@@ -205,12 +210,16 @@ fn main() -> std::io::Result<()> {
     // Add missing methods that the main code expects
     out.push_str("    pub fn load_existing_admin_keys(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {\n");
     out.push_str("        // Load existing admin keys from file system\n");
-    out.push_str("        let admin_keys_file = std::path::Path::new(\"/var/lib/easyp/admin_keys\");\n");
+    out.push_str(
+        "        let admin_keys_file = std::path::Path::new(\"/var/lib/easyp/admin_keys\");\n",
+    );
     out.push_str("        if admin_keys_file.exists() {\n");
     out.push_str("            if let Ok(content) = std::fs::read_to_string(admin_keys_file) {\n");
     out.push_str("                for line in content.lines() {\n");
     out.push_str("                    if let Some((key, value)) = line.split_once('_') {\n");
-    out.push_str("                        self.admin_keys.insert(key.to_string(), value.to_string());\n");
+    out.push_str(
+        "                        self.admin_keys.insert(key.to_string(), value.to_string());\n",
+    );
     out.push_str("                    }\n");
     out.push_str("                }\n");
     out.push_str("            }\n");
@@ -229,7 +238,9 @@ fn main() -> std::io::Result<()> {
     out.push_str("            for entry in entries.flatten() {\n");
     out.push_str("                if let Some(file_name) = entry.file_name().to_str() {\n");
     out.push_str("                    if file_name.ends_with(\".admin.rs\") {\n");
-    out.push_str("                        let ext_name = file_name.replace(\".admin.rs\", \"\");\n");
+    out.push_str(
+        "                        let ext_name = file_name.replace(\".admin.rs\", \"\");\n",
+    );
     out.push_str("                        if !self.admin_keys.contains_key(&ext_name) {\n");
     out.push_str("                            use std::collections::hash_map::DefaultHasher;\n");
     out.push_str("                            use std::hash::{Hash, Hasher};\n");
@@ -246,7 +257,9 @@ fn main() -> std::io::Result<()> {
     out.push_str("        }\n");
     out.push_str("        \n");
     out.push_str("        if needs_save {\n");
-    out.push_str("            let admin_keys_file = std::path::Path::new(\"/var/lib/easyp/admin_keys\");\n");
+    out.push_str(
+        "            let admin_keys_file = std::path::Path::new(\"/var/lib/easyp/admin_keys\");\n",
+    );
     out.push_str("            if let Some(parent) = admin_keys_file.parent() {\n");
     out.push_str("                let _ = std::fs::create_dir_all(parent);\n");
     out.push_str("            }\n");
@@ -266,13 +279,10 @@ fn main() -> std::io::Result<()> {
 
     out.push_str("    pub fn initialize_root_extensions(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {\n");
     out.push_str("        // Initialize root extensions\n");
-    
+
     // Generate root extension initialization for each .root.rs file found at build time
     for (ident, _filename) in &root_entries {
-        out.push_str(&format!(
-            "        // Initialize {} root extension\n",
-            ident
-        ));
+        out.push_str(&format!("        // Initialize {} root extension\n", ident));
         out.push_str(&format!(
             "        if let Err(e) = {}_root::setup_{}_directories() {{\n",
             ident, ident
@@ -283,24 +293,21 @@ fn main() -> std::io::Result<()> {
         ));
         out.push_str("        }\n");
     }
-    
+
     out.push_str("        Ok(())\n");
     out.push_str("    }\n\n");
 
     out.push_str("    pub fn handle_bin_request(&self, bin_path: &str, method: &str, query_string: &str, headers: &std::collections::HashMap<String, String>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {\n");
     out.push_str("        // Handle bin request dynamically based on .bin.rs files\n");
     out.push_str("        match bin_path {\n");
-    
+
     // Generate match arms for each .bin.rs file
     if let Ok(entries) = std::fs::read_dir("extensions") {
         for entry in entries.flatten() {
             if let Some(file_name) = entry.file_name().to_str() {
                 if file_name.ends_with(".bin.rs") {
                     let ext_name = file_name.replace(".bin.rs", "");
-                    out.push_str(&format!(
-                        "            \"/cgi-bin/{}\" => {{\n",
-                        ext_name
-                    ));
+                    out.push_str(&format!("            \"/cgi-bin/{}\" => {{\n", ext_name));
                     out.push_str(&format!(
                         "                {}_bin::handle_{}_request(method, bin_path, \"localhost\", query_string, headers)\n",
                         ext_name, ext_name
@@ -311,7 +318,7 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
-    
+
     out.push_str("            _ => {\n");
     out.push_str("                Err(Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, \"Bin extension not found\")) as Box<dyn std::error::Error + Send + Sync>)\n");
     out.push_str("            }\n");
