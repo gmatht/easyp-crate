@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH, Duration};
 
 use super::http_version::HttpVersion;
 use super::http_response::HttpResponse;
+use super::file_cache::{FileCacheInfo, should_return_not_modified, parse_conditional_headers};
 
 // Unix-specific imports for privilege dropping
 //#[cfg(unix)]
@@ -473,7 +474,147 @@ impl SecureFileServer {
         self.serve_file_with_domain(request_path, None)
     }
 
-    /// Serve a file with domain-specific document root
+    /// Serve a file with domain-specific document root and caching support
+    ///
+    /// # Arguments
+    /// * `request_path` - The requested file path
+    /// * `domain` - Optional domain name for domain-specific document root
+    /// * `request` - Raw HTTP request for conditional request handling
+    /// * `version` - HTTP version
+    /// * `keep_alive` - Whether to keep connection alive
+    ///
+    /// # Returns
+    /// * `Result<Option<Vec<u8>>, Box<dyn std::error::Error>>` - HTTP response bytes if found, None if not found
+    pub fn serve_file_with_domain_and_caching(
+        &self,
+        request_path: &str,
+        domain: Option<&str>,
+        request: &str,
+        version: &HttpVersion,
+        keep_alive: bool
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+        // Check for redirects first using domain-specific document root
+        if let Some(redirect_url) = self.check_redirect_with_domain(request_path, domain) {
+            let response = self.generate_redirect_response(&redirect_url, version, keep_alive);
+            return Ok(Some(response.as_bytes().to_vec()));
+        }
+
+        // Get the appropriate document root for this domain
+        let document_root = if let Some(domain) = domain {
+            self.get_domain_document_root(domain)
+        } else {
+            self.config.document_root.clone()
+        };
+
+        // Handle directory requests (paths ending with /)
+        if request_path.ends_with('/') {
+            let clean_path = request_path.trim_start_matches('/');
+            let dir_path = document_root.join(clean_path);
+
+            if dir_path.is_dir() {
+                // Try to serve index.html or index.htm from the directory
+                let index_html = dir_path.join("index.html");
+                let index_htm = dir_path.join("index.htm");
+
+                let file_to_serve = if index_html.exists() {
+                    index_html
+                } else if index_htm.exists() {
+                    index_htm
+                } else {
+                    // No index file found, return 404
+                    return Ok(None);
+                };
+
+                return self.serve_file_with_caching(&file_to_serve, request, version, keep_alive);
+            }
+        }
+
+        // For regular file requests, use the existing sanitize_path logic with domain-specific root
+        let file_path = match self.sanitize_path_with_root(request_path, &document_root) {
+            Ok(path) => path,
+            Err(e) => {
+                println!("Security error serving {}: {}", request_path, e);
+                return Ok(None); // Return None to indicate file not found (security through obscurity)
+            }
+        };
+
+        self.serve_file_with_caching(&file_path, request, version, keep_alive)
+    }
+
+    /// Serve a file with caching support
+    ///
+    /// # Arguments
+    /// * `file_path` - Path to the file to serve
+    /// * `request` - Raw HTTP request for conditional request handling
+    /// * `version` - HTTP version
+    /// * `keep_alive` - Whether to keep connection alive
+    ///
+    /// # Returns
+    /// * `Result<Option<Vec<u8>>, Box<dyn std::error::Error>>` - HTTP response bytes if found, None if not found
+    fn serve_file_with_caching(
+        &self,
+        file_path: &Path,
+        request: &str,
+        version: &HttpVersion,
+        keep_alive: bool,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+        // Get file metadata for caching
+        let metadata = match std::fs::metadata(file_path) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                println!("Error getting metadata for file {}: {}", file_path.display(), e);
+                return Ok(None);
+            }
+        };
+
+        let cache_info = FileCacheInfo::from_metadata(&metadata);
+        let mime_type = self.get_mime_type(file_path);
+
+        // Parse conditional request headers
+        let (if_modified_since, if_none_match) = parse_conditional_headers(request);
+
+        // Check if we should return 304 Not Modified
+        if should_return_not_modified(&cache_info, if_modified_since.as_deref(), if_none_match.as_deref()) {
+            let mut response = HttpResponse::not_modified(&cache_info.last_modified_http(), &cache_info.etag);
+            let response_bytes = response.encode(version, keep_alive);
+            return Ok(Some(response_bytes));
+        }
+
+        // Read file contents
+        let mut file = match File::open(file_path) {
+            Ok(file) => file,
+            Err(e) => {
+                println!("Error opening file {}: {}", file_path.display(), e);
+                return Ok(None);
+            }
+        };
+
+        let mut contents = Vec::new();
+        if let Err(e) = file.read_to_end(&mut contents) {
+            println!("Error reading file {}: {}", file_path.display(), e);
+            return Ok(None);
+        }
+
+        // Create HTTP response with caching headers
+        let mut response = HttpResponse::ok(contents);
+        response.set_content_type(&mime_type);
+        response.set_content_length();
+
+        // Add caching headers
+        let cache_duration = cache_info.get_cache_duration(&mime_type);
+        response.add_caching_headers(&cache_info.last_modified_http(), &cache_info.etag, cache_duration);
+
+        // Add security headers (without overriding cache control)
+        response.add_security_headers_no_cache_override();
+
+        println!("Successfully served file: {} ({} bytes, cache: {}s)",
+                file_path.display(), cache_info.size, cache_duration);
+
+        let response_bytes = response.encode(version, keep_alive);
+        Ok(Some(response_bytes))
+    }
+
+    /// Serve a file with domain-specific document root (backward compatibility)
     /// Returns Ok(None) if file doesn't exist, Ok(Some(content)) if file exists
     /// Returns Ok(Some(redirect_response)) if redirect is needed
     pub fn serve_file_with_domain(&self, request_path: &str, domain: Option<&str>) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {

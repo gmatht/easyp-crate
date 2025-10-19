@@ -1207,68 +1207,19 @@ impl OnDemandHttpsServer {
 
         println!("Requested path: {}", request_path);
 
-        // Try to serve the requested file using secure file server with domain-specific document root
-        let serve_result = secure_file_server.serve_file_with_domain(request_path, domain.as_deref());
+        // Try to serve the requested file using secure file server with caching support
+        let serve_result = secure_file_server.serve_file_with_domain_and_caching(
+            request_path,
+            domain.as_deref(),
+            &request,
+            &http_version,
+            should_keep_alive
+        );
         match serve_result {
-            Ok(Some(file_content)) => {
-                // Check if this is a redirect response (starts with "HTTP/1.1 301")
-                if file_content.starts_with(b"HTTP/1.1 301") {
-                    // This is a redirect response, send it directly
-                    stream.write_all(&file_content).await?;
-                    stream.flush().await?;
-                } else {
-                    // This is regular file content, process extensions if it's HTML
-                    let mut processed_content = file_content.clone();
-
-                    // Check if this is HTML content that needs extension processing
-                    if let Ok(content_string) = String::from_utf8(file_content.clone()) {
-                        // Process extensions in the HTML content
-                        #[cfg(feature = "extensions")]
-                        {
-                            let processed_html = extension_registry.lock().unwrap().process_html(&content_string, request_path);
-                            processed_content = processed_html.into_bytes();
-                        }
-                    }
-
-                    // For directory index files, we need to determine the actual file path for MIME type detection
-                    let file_path_for_mime = if request_path.ends_with('/') {
-                        // This is a directory request, determine the actual index file
-                        let clean_path = request_path.trim_start_matches('/');
-                        let domain_doc_root = secure_file_server.get_domain_document_root(domain.as_deref().unwrap_or(""));
-                        let dir_path = domain_doc_root.join(clean_path);
-                        let index_html = dir_path.join("index.html");
-                        let index_htm = dir_path.join("index.htm");
-
-                        if index_html.exists() {
-                            index_html
-                        } else if index_htm.exists() {
-                            index_htm
-                        } else {
-                            std::path::PathBuf::from("index.html") // fallback
-                        }
-                    } else {
-                        std::path::PathBuf::from(request_path)
-                    };
-
-                    // Generate HTTP response with proper MIME type
-                    let mime_type = secure_file_server.get_mime_type(&file_path_for_mime);
-                    let content_length = processed_content.len();
-
-                    // Use HttpResponse builder for version-aware response
-                    let mut response = HttpResponse::ok(processed_content.clone());
-                    response.set_content_type(&mime_type);
-                    response.set_content_length();
-                    response.add_security_headers();
-
-                    let response_headers = response.encode(&http_version, should_keep_alive);
-
-                    // Write response (headers + content) in chunks to handle large files
-                    let response_bytes = &response_headers;
-
-                    // Write complete response (headers + content)
-                    stream.write_all(response_bytes).await?;
-                    stream.flush().await?;
-                }
+            Ok(Some(response_bytes)) => {
+                // This is a complete HTTP response (with caching headers)
+                stream.write_all(&response_bytes).await?;
+                stream.flush().await?;
             }
             Ok(None) => {
                 // File not found - check if this is a root request (index.html missing)
@@ -1776,65 +1727,19 @@ impl OnDemandHttpsServer {
             }
         }
 
-        // Try to serve the requested file using secure file server with domain-specific document root
-        match secure_file_server.serve_file_with_domain(request_path, Some(server_name)) {
-            Ok(Some(file_content)) => {
-                // Check if this is a redirect response (starts with "HTTP/1.1 301")
-                if file_content.starts_with(b"HTTP/1.1 301") {
-                    // This is a redirect response, send it directly
-                    conn.writer().write_all(&file_content)?;
-                    conn.write_tls(stream)?;
-                    conn.complete_io(stream)?;
-                } else {
-                    // This is regular file content, process extensions if it's HTML
-                    let mut processed_content = file_content.clone();
-
-                    // Check if this is HTML content that needs extension processing
-                    if let Ok(content_string) = String::from_utf8(file_content.clone()) {
-                        // Process extensions in the HTML content
-                        #[cfg(feature = "extensions")]
-                        {
-                            let processed_html = extension_registry.lock().unwrap().process_html(&content_string, request_path);
-                            processed_content = processed_html.into_bytes();
-                        }
-                    }
-
-                    // For directory index files, we need to determine the actual file path for MIME type detection
-                    let file_path_for_mime = if request_path.ends_with('/') {
-                        // This is a directory request, determine the actual index file
-                        let clean_path = request_path.trim_start_matches('/');
-                        let domain_doc_root = secure_file_server.get_domain_document_root(server_name);
-                        let dir_path = domain_doc_root.join(clean_path);
-                        let index_html = dir_path.join("index.html");
-                        let index_htm = dir_path.join("index.htm");
-
-                        if index_html.exists() {
-                            index_html
-                        } else if index_htm.exists() {
-                            index_htm
-                        } else {
-                            std::path::PathBuf::from("index.html") // fallback
-                        }
-                    } else {
-                        std::path::PathBuf::from(request_path)
-                    };
-
-                    // Generate HTTP response with proper MIME type
-                    let mime_type = secure_file_server.get_mime_type(&file_path_for_mime);
-
-                    // Use HttpResponse builder for version-aware response (default to HTTP/1.1 for HTTPS)
-                    let mut response = HttpResponse::ok(processed_content.clone());
-                    response.set_content_type(&mime_type);
-                    response.set_content_length();
-                    response.add_security_headers();
-
-                    let response_bytes = response.encode(&HttpVersion::Http11, false); // Default to close for HTTPS
-
-                    // Write complete response (headers + content)
-                    conn.writer().write_all(&response_bytes)?;
-                    conn.write_tls(stream)?;
-                    conn.complete_io(stream)?;
-                }
+        // Try to serve the requested file using secure file server with caching support
+        match secure_file_server.serve_file_with_domain_and_caching(
+            request_path,
+            Some(server_name),
+            &request,
+            &HttpVersion::Http11,
+            false // Default to close for HTTPS
+        ) {
+            Ok(Some(response_bytes)) => {
+                // This is a complete HTTP response (with caching headers)
+                conn.writer().write_all(&response_bytes)?;
+                conn.write_tls(stream)?;
+                conn.complete_io(stream)?;
             }
             Ok(None) => {
                 // File not found - check if this is a root request (index.html missing)
