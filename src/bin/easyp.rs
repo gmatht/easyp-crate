@@ -545,9 +545,13 @@ impl OnDemandHttpsServer {
         // Create HTTPS listener on specified port for HTTPS traffic
         let https_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", final_https_port)).await?;
 
-        // Look up www-data UID/GID dynamically (only on UNIX systems)
+        // Look up www-data UID/GID dynamically (only on UNIX systems and when running as root)
         #[cfg(unix)]
-        let (www_data_uid, www_data_gid) = get_www_data_uid_gid()?;
+        let (www_data_uid, www_data_gid) = if is_running_as_root() {
+            get_www_data_uid_gid()?
+        } else {
+            (0, 0) // Use current user if not root
+        };
 
         // Create secure file server with security features
         let document_root = if args.root.starts_with('/') {
@@ -590,9 +594,9 @@ impl OnDemandHttpsServer {
                 "htaccess".to_string(), "htpasswd".to_string(),
             ],
             #[cfg(unix)]
-            drop_to_uid: Some(www_data_uid),
+            drop_to_uid: if is_running_as_root() { Some(www_data_uid) } else { None },
             #[cfg(unix)]
-            drop_to_gid: Some(www_data_gid),
+            drop_to_gid: if is_running_as_root() { Some(www_data_gid) } else { None },
             #[cfg(not(unix))]
             drop_to_uid: None,
             #[cfg(not(unix))]
@@ -786,11 +790,12 @@ impl OnDemandHttpsServer {
                 #[cfg(not(feature = "extensions"))]
                 let extension_registry = Arc::new(Mutex::new(ExtensionRegistry::new()));
 
-               // Drop privileges to unprivileged user after binding to privileged ports
-               if let Err(e) = secure_file_server.drop_privileges() {
-                   println!("Warning: Failed to drop privileges: {}", e);
-                   // Continue anyway - this is not a fatal error
-               } else {
+               // Drop privileges to unprivileged user after binding to privileged ports (only if running as root)
+               if is_running_as_root() {
+                   if let Err(e) = secure_file_server.drop_privileges() {
+                       println!("Warning: Failed to drop privileges: {}", e);
+                       // Continue anyway - this is not a fatal error
+                   } else {
                    // Verify that privileges were dropped successfully
                    match std::process::Command::new("whoami").output() {
                        Ok(output) => {
@@ -805,6 +810,9 @@ impl OnDemandHttpsServer {
                            println!("Warning: Could not determine current user after privilege drop");
                        }
                    }
+               }
+               } else {
+                   println!("Not running as root, skipping privilege dropping");
                }
 
 
@@ -1242,20 +1250,21 @@ impl OnDemandHttpsServer {
                                     let processed_html = extension_registry.lock().unwrap().process_html(body, request_path);
                                     println!("DEBUG: Extension processing completed, processed HTML length: {}", processed_html.len());
                                     // Reconstruct the response with processed HTML
-                                    let headers = &response_string[..body_start + 4];
+                                    let headers = &response_string[..body_start];
                                     let new_content_length = processed_html.len();
                                     // Update Content-Length header
-                                    let updated_headers = response_string
+                                    let updated_headers = headers
                                         .lines()
                                         .map(|line| {
                                             if line.starts_with("Content-Length:") {
-                                                format!("Content-Length: {}\r\n", new_content_length)
+                                                format!("Content-Length: {}", new_content_length)
                                             } else {
-                                                format!("{}\r\n", line)
+                                                line.to_string()
                                             }
                                         })
-                                        .collect::<String>();
-                                    format!("{}{}", updated_headers, processed_html).into_bytes()
+                                        .collect::<Vec<String>>()
+                                        .join("\r\n");
+                                    format!("{}\r\n\r\n{}", updated_headers, processed_html).into_bytes()
                                 }
                                 #[cfg(not(feature = "extensions"))]
                                 {
@@ -1560,20 +1569,21 @@ impl OnDemandHttpsServer {
                                     let processed_html = extension_registry.lock().unwrap().process_html(body, path);
                                     println!("DEBUG: Extension processing completed, processed HTML length: {}", processed_html.len());
                                     // Reconstruct the response with processed HTML
-                                    let headers = &response_string[..body_start + 4];
+                                    let headers = &response_string[..body_start];
                                     let new_content_length = processed_html.len();
                                     // Update Content-Length header
-                                    let updated_headers = response_string
+                                    let updated_headers = headers
                                         .lines()
                                         .map(|line| {
                                             if line.starts_with("Content-Length:") {
-                                                format!("Content-Length: {}\r\n", new_content_length)
+                                                format!("Content-Length: {}", new_content_length)
                                             } else {
-                                                format!("{}\r\n", line)
+                                                line.to_string()
                                             }
                                         })
-                                        .collect::<String>();
-                                    format!("{}{}", updated_headers, processed_html).into_bytes()
+                                        .collect::<Vec<String>>()
+                                        .join("\r\n");
+                                    format!("{}\r\n\r\n{}", updated_headers, processed_html).into_bytes()
                                 }
                                 #[cfg(not(feature = "extensions"))]
                                 {
@@ -2740,10 +2750,15 @@ fn check_www_data_user_exists() -> Result<bool, Box<dyn std::error::Error>> {
     Ok(false)
 }
 
-/// Ensure www-data user exists, create if necessary
+/// Ensure www-data user exists, create if necessary (only when running as root)
 #[cfg(unix)]
 fn ensure_www_data_user() -> Result<(), Box<dyn std::error::Error>> {
     use std::process::Command;
+
+    // Only attempt to create user if running as root
+    if !is_running_as_root() {
+        return Err("Cannot create www-data user: not running as root".into());
+    }
 
     #[cfg(target_os = "redox")]
     {
@@ -2853,6 +2868,17 @@ fn parse_www_data_from_passwd() -> Result<(u32, u32), Box<dyn std::error::Error>
     }
 
     Err("www-data user not found in /etc/passwd".into())
+}
+
+/// Check if the current process is running as root
+#[cfg(unix)]
+fn is_running_as_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn is_running_as_root() -> bool {
+    false // On non-Unix systems, assume not root
 }
 
 /// Look up the UID and GID for the www-data user

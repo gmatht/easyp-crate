@@ -29,6 +29,7 @@ fn main() -> std::io::Result<()> {
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("generated_extensions.rs");
 
+
     let mut expand_entries = Vec::new();
     let mut bin_entries = Vec::new();
     let mut root_entries = Vec::new();
