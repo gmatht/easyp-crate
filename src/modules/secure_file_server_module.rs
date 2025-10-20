@@ -78,6 +78,62 @@ fn format_http_date(time: &SystemTime) -> String {
             day_of_week, day_of_month, month_name, year, hours, minutes, seconds)
 }
 
+// Simple HTTP method classification for file serving
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum HttpMethod {
+    Get,
+    Head,
+    Other,
+}
+
+// Parse method and a single Range header (bytes=...)
+fn parse_method_and_range(request: &str) -> (HttpMethod, Option<(u64, Option<u64>)>) {
+    // Method from request line
+    let method = request
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or("");
+    let method = match method {
+        "GET" => HttpMethod::Get,
+        "HEAD" => HttpMethod::Head,
+        _ => HttpMethod::Other,
+    };
+
+    // Range: bytes=start-end | bytes=start- | bytes=-suffix
+    let mut range: Option<(u64, Option<u64>)> = None;
+    for line in request.lines() {
+        if line.to_ascii_lowercase().starts_with("range:") {
+            if let Some(v) = line.splitn(2, ':').nth(1) {
+                let v = v.trim();
+                if let Some(spec) = v.strip_prefix("bytes=") {
+                    if let Some((start_s, end_s)) = spec.split_once('-') {
+                        if !start_s.trim().is_empty() {
+                            if let Ok(start) = start_s.trim().parse::<u64>() {
+                                let end = if end_s.trim().is_empty() {
+                                    None
+                                } else {
+                                    end_s.trim().parse::<u64>().ok()
+                                };
+                                range = Some((start, end));
+                            }
+                        } else {
+                            // suffix form: bytes=-SUFFIX
+                            if let Ok(suffix) = end_s.trim().parse::<u64>() {
+                                // Encode suffix as (u64::MAX, Some(suffix)); to be resolved later
+                                range = Some((u64::MAX, Some(suffix)));
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    (method, range)
+}
+
 /// MIME type mappings for common file extensions
 #[derive(Debug, Clone)]
 pub struct MimeTypes {
@@ -552,7 +608,7 @@ impl SecureFileServer {
         version: &HttpVersion,
         keep_alive: bool,
     ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-        // Get file metadata for caching
+        // Get file metadata and basic info
         let metadata = match std::fs::metadata(file_path) {
             Ok(metadata) => metadata,
             Err(e) => {
@@ -561,20 +617,110 @@ impl SecureFileServer {
             }
         };
 
+        let total_size = metadata.len();
         let cache_info = FileCacheInfo::from_metadata(&metadata);
         let mime_type = self.get_mime_type(file_path);
 
-        // Parse conditional request headers
-        let (if_modified_since, if_none_match) = parse_conditional_headers(request);
+        // Method and Range parsing
+        let (method, mut range_spec) = parse_method_and_range(request);
+        let head_only = method == HttpMethod::Head;
 
-        // Check if we should return 304 Not Modified
+        // Conditional request handling (applies to both GET/HEAD)
+        let (if_modified_since, if_none_match) = parse_conditional_headers(request);
         if should_return_not_modified(&cache_info, if_modified_since.as_deref(), if_none_match.as_deref()) {
             let mut response = HttpResponse::not_modified(&cache_info.last_modified_http(), &cache_info.etag);
+            response.set_header("Accept-Ranges", "bytes");
             let response_bytes = response.encode(version, keep_alive);
             return Ok(Some(response_bytes));
         }
 
-        // Read file contents
+        // Resolve suffix range (bytes=-SUFFIX) encoded as (u64::MAX, Some(suffix))
+        if let Some((start, end_opt)) = range_spec {
+            if start == u64::MAX {
+                if let Some(suffix) = end_opt {
+                    if suffix == 0 {
+                        range_spec = None;
+                    } else {
+                        let use_len = suffix.min(total_size);
+                        let new_start = total_size.saturating_sub(use_len);
+                        let new_end = total_size.saturating_sub(1);
+                        range_spec = Some((new_start, Some(new_end)));
+                    }
+                } else {
+                    range_spec = None;
+                }
+            }
+        }
+
+        // Validate and clamp explicit range to file size
+        let valid_range = if let Some((start, end_opt)) = range_spec {
+            if start >= total_size {
+                None
+            } else {
+                let end = end_opt.unwrap_or_else(|| total_size.saturating_sub(1));
+                if end < start { None } else { Some((start, end.min(total_size.saturating_sub(1)))) }
+            }
+        } else { None };
+
+        // If client sent an invalid/unsatisfiable range, send 416 per RFC 7233
+        if range_spec.is_some() && valid_range.is_none() {
+            let mut response = HttpResponse::new(416, "Range Not Satisfiable", Vec::new());
+            response.set_header("Accept-Ranges", "bytes");
+            response.set_header("Content-Range", &format!("bytes */{}", total_size));
+            let response_bytes = response.encode(version, keep_alive);
+            return Ok(Some(response_bytes));
+        }
+
+        // Partial content path
+        if let Some((start, end)) = valid_range {
+            let content_len = end - start + 1;
+
+            let mut response = HttpResponse::new(206, "Partial Content", Vec::new());
+            response.set_content_type(&mime_type);
+            response.set_header("Accept-Ranges", "bytes");
+            response.add_caching_headers(&cache_info.last_modified_http(), &cache_info.etag, cache_info.get_cache_duration(&mime_type));
+            response.set_header("Content-Range", &format!("bytes {}-{}/{}", start, end, total_size));
+            response.set_header("Content-Length", &content_len.to_string());
+
+            if !head_only {
+                // Read only requested slice
+                let mut file = match File::open(file_path) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        println!("Error opening file {}: {}", file_path.display(), e);
+                        return Ok(None);
+                    }
+                };
+                use std::io::{Seek, SeekFrom, Read};
+                if let Err(e) = file.seek(SeekFrom::Start(start)) {
+                    println!("Error seeking file {}: {}", file_path.display(), e);
+                    return Ok(None);
+                }
+                let mut contents = vec![0u8; content_len as usize];
+                if let Err(e) = file.read_exact(&mut contents) {
+                    println!("Error reading range from file {}: {}", file_path.display(), e);
+                    return Ok(None);
+                }
+                response.body = contents;
+            }
+
+            let response_bytes = response.encode(version, keep_alive);
+            return Ok(Some(response_bytes));
+        }
+
+        // No (valid) Range: build full response. For HEAD: headers only.
+        let mut response = HttpResponse::ok(Vec::new());
+        response.set_content_type(&mime_type);
+        response.set_header("Accept-Ranges", "bytes");
+        response.add_caching_headers(&cache_info.last_modified_http(), &cache_info.etag, cache_info.get_cache_duration(&mime_type));
+
+        if head_only {
+            response.set_header("Content-Length", &total_size.to_string());
+            let response_bytes = response.encode(version, keep_alive);
+            return Ok(Some(response_bytes));
+        }
+
+        // GET full body
         let mut file = match File::open(file_path) {
             Ok(file) => file,
             Err(e) => {
@@ -582,40 +728,26 @@ impl SecureFileServer {
                 return Ok(None);
             }
         };
-
         let mut contents = Vec::new();
         if let Err(e) = file.read_to_end(&mut contents) {
             println!("Error reading file {}: {}", file_path.display(), e);
             return Ok(None);
         }
 
-        // Process HTML content for extensions if it's an HTML file
+        // Process HTML content note (leave processing to caller if enabled)
         if mime_type.starts_with("text/html") {
-            if let Ok(content_string) = String::from_utf8(contents.clone()) {
-                // Process extensions in the HTML content
+            if let Ok(_content_string) = String::from_utf8(contents.clone()) {
                 #[cfg(feature = "extensions")]
                 {
-                    // Note: We need access to extension_registry here, but this function doesn't have it
-                    // For now, we'll process extensions in the calling code
                     println!("DEBUG: HTML file detected, but extension processing needs to be done in calling code");
                 }
             }
         }
 
-        // Create HTTP response with caching headers
-        let mut response = HttpResponse::ok(contents);
-        response.set_content_type(&mime_type);
+        response.body = contents;
         response.set_content_length();
 
-        // Add caching headers
-        let cache_duration = cache_info.get_cache_duration(&mime_type);
-        response.add_caching_headers(&cache_info.last_modified_http(), &cache_info.etag, cache_duration);
-
-        // Add security headers (without overriding cache control)
-        response.add_security_headers_no_cache_override();
-
-        println!("Successfully served file: {} ({} bytes, cache: {}s)",
-                file_path.display(), cache_info.size, cache_duration);
+        println!("Successfully served file: {} ({} bytes)", file_path.display(), cache_info.size);
 
         let response_bytes = response.encode(version, keep_alive);
         Ok(Some(response_bytes))
