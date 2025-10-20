@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig as TokioServerConfig;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -64,6 +66,8 @@ mod http_version;
 mod http_response;
 #[path = "../modules/connection_policy.rs"]
 mod connection_policy;
+#[path = "../modules/file_cache.rs"]
+mod file_cache;
 
 use http_version::HttpVersion;
 use http_response::HttpResponse;
@@ -973,38 +977,38 @@ impl OnDemandHttpsServer {
 
         // Keep-Alive loop: handle multiple requests on the same connection
         loop {
-            // Read HTTP request
-            let mut buffer = [0; 4096];
-            let mut total_read = 0;
+        // Read HTTP request
+        let mut buffer = [0; 4096];
+        let mut total_read = 0;
 
-            // Read data in a loop to handle partial reads
-            loop {
-                match stream.read(&mut buffer[total_read..]).await {
+        // Read data in a loop to handle partial reads
+        loop {
+            match stream.read(&mut buffer[total_read..]).await {
                     Ok(0) => {
                         // Connection closed by client
                         println!("DEBUG: HTTP connection closed by client");
                         return Ok(());
                     }
-                    Ok(n) => {
-                        total_read += n;
-                        if total_read >= buffer.len() {
-                            break; // Buffer full
-                        }
-                        // Check if we have a complete HTTP request
-                        if let Ok(request_str) = std::str::from_utf8(&buffer[..total_read]) {
-                            if request_str.contains("\r\n\r\n") {
-                                break; // Complete HTTP request received
-                            }
+                Ok(n) => {
+                    total_read += n;
+                    if total_read >= buffer.len() {
+                        break; // Buffer full
+                    }
+                    // Check if we have a complete HTTP request
+                    if let Ok(request_str) = std::str::from_utf8(&buffer[..total_read]) {
+                        if request_str.contains("\r\n\r\n") {
+                            break; // Complete HTTP request received
                         }
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No data available, wait a bit
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(e) => return Err(e.into()),
                 }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No data available, wait a bit
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
             }
+        }
 
         // Parse HTTP request
         let request = String::from_utf8_lossy(&buffer[..total_read]);
@@ -1219,7 +1223,7 @@ impl OnDemandHttpsServer {
             Ok(Some(response_bytes)) => {
                 // This is a complete HTTP response (with caching headers)
                 stream.write_all(&response_bytes).await?;
-                stream.flush().await?;
+                    stream.flush().await?;
             }
             Ok(None) => {
                 // File not found - check if this is a root request (index.html missing)
@@ -1242,7 +1246,7 @@ impl OnDemandHttpsServer {
 
                     let response_bytes = response.encode(&http_version, should_keep_alive);
                     stream.write_all(&response_bytes).await?;
-                    stream.flush().await?;
+        stream.flush().await?;
                 }
             }
             Err(e) => {
@@ -1298,22 +1302,279 @@ impl OnDemandHttpsServer {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("🔍 Starting HTTPS connection handling");
 
-        // Convert tokio::net::TcpStream to std::net::TcpStream for rustls
-        let std_stream = stream.into_std()?;
-
-        // Run the TLS handshake in a blocking context
-        let result = tokio::task::spawn_blocking(move || {
-            Self::handle_https_connection_blocking(
-                std_stream,
+        // Use the new async HTTPS handler
+        Self::handle_https_connection_async(
+            stream,
                 cert_resolver,
                 args,
                 extension_registry,
                 http_challenges,
                 secure_file_server,
-            )
-        }).await??;
+        ).await
+    }
 
-        Ok(result)
+    /// Handle HTTPS connection using async tokio-rustls (for large file support)
+    async fn handle_https_connection_async(
+        stream: tokio::net::TcpStream,
+        cert_resolver: Arc<dyn ResolvesServerCert + Send + Sync>,
+        args: Args,
+        extension_registry: Arc<Mutex<ExtensionRegistry>>,
+        http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
+        secure_file_server: SecureFileServer,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        println!("🔍 Starting async HTTPS connection handling");
+
+        // Create server config with our certificate resolver
+        let server_config = TokioServerConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into()
+        )
+        .with_no_client_auth()
+        .with_cert_resolver(cert_resolver)?;
+
+        // Create tokio-rustls acceptor
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        // Perform TLS handshake
+        let mut tls_stream = acceptor.accept(stream).await?;
+        println!("🔍 TLS handshake completed");
+
+        // Handle the connection with Keep-Alive support
+        let mut connection_policy = ConnectionPolicy::new(100, 300);
+        let mut request_count = 0;
+
+        loop {
+            request_count += 1;
+            println!("🔍 Processing async HTTPS request {} for domain", request_count);
+
+            // Process the request and get parsed version/connection info
+            let (http_version, connection_header) = Self::process_https_request_async(
+                &mut tls_stream,
+                &extension_registry,
+                &http_challenges,
+                &secure_file_server,
+            ).await?;
+
+            // Determine if we should keep the connection alive
+            let should_keep_alive = connection_policy.should_keep_alive(
+                &http_version,
+                connection_header.as_deref(),
+                0, // We don't have response size here, but it's not critical for the decision
+                request_count,
+            );
+
+            println!("🔍 Async HTTPS request {} completed (version: {}, keep_alive: {})",
+                request_count, http_version, should_keep_alive);
+
+            if !should_keep_alive {
+                println!("DEBUG: Closing async HTTPS connection after {} requests (version: {})",
+                    request_count, http_version);
+                // Properly shut down the TLS connection
+                use tokio::io::AsyncWriteExt;
+                let _ = tls_stream.shutdown().await;
+                break; // Exit the Keep-Alive loop
+            }
+
+            println!("DEBUG: Keeping async HTTPS connection alive for next request (version: {})",
+                http_version);
+        }
+
+        Ok(())
+    }
+
+    /// Process a single HTTPS request using async tokio-rustls
+    async fn process_https_request_async(
+        tls_stream: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        extension_registry: &Arc<Mutex<ExtensionRegistry>>,
+        http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
+        secure_file_server: &SecureFileServer,
+    ) -> Result<(HttpVersion, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Read the request
+        let mut buffer = [0; 4096];
+        let n = tls_stream.read(&mut buffer).await?;
+        if n == 0 {
+            return Err("Connection closed by client".into());
+        }
+
+        let request = String::from_utf8_lossy(&buffer[..n]);
+        println!("🔍 Async HTTPS request received: {}", request.lines().next().unwrap_or(""));
+
+        // Parse the request
+        let lines: Vec<&str> = request.lines().collect();
+        if lines.is_empty() {
+            return Err("Empty request".into());
+        }
+
+        let first_line = lines[0];
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        if parts.len() < 3 {
+            return Err("Invalid request line".into());
+        }
+
+        let method = parts[0];
+        let path = parts[1];
+        let http_version_str = parts[2];
+
+        // Parse HTTP version
+        let http_version = HttpVersion::from_request_line(first_line);
+
+        // Extract server name from Host header
+        let server_name = lines.iter()
+            .find(|line| line.starts_with("Host:"))
+            .and_then(|line| line.split(':').nth(1))
+            .map(|host| host.trim().to_string())
+            .unwrap_or_else(|| "localhost".to_string());
+
+        println!("🔍 Async HTTPS request: {} {} {} (server: {})", method, path, http_version_str, server_name);
+
+        // Extract connection header from request
+        let connection_header = lines.iter()
+            .find(|line| line.to_lowercase().starts_with("connection:"))
+            .and_then(|line| line.split(':').nth(1))
+            .map(|conn| conn.trim().to_string());
+
+        // Handle ACME challenges
+        if path.starts_with("/.well-known/acme-challenge/") {
+            let token = path.trim_start_matches("/.well-known/acme-challenge/");
+            let key_authorization = {
+                let challenges = http_challenges.lock().unwrap();
+                challenges.get(token).cloned()
+            };
+            if let Some(key_authorization) = key_authorization {
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    key_authorization.len(), key_authorization);
+                tls_stream.write_all(response.as_bytes()).await?;
+                tls_stream.flush().await?;
+                return Ok((HttpVersion::Http11, Some("close".to_string())));
+            }
+        }
+
+        // Handle extensions
+        if path.starts_with("/extensions/") {
+            let ext_name = path.trim_start_matches("/extensions/");
+            let ext_content = {
+                let registry = extension_registry.lock().unwrap();
+                registry.admin_keys.get(ext_name).cloned()
+            };
+            if let Some(ext) = ext_content {
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    ext.len(), ext);
+                tls_stream.write_all(response.as_bytes()).await?;
+                tls_stream.flush().await?;
+                return Ok((http_version.clone(), Some("close".to_string())));
+            }
+        }
+
+        // Determine if we should keep the connection alive (passed to response builder)
+        // For now, we'll use a simple heuristic based on HTTP version
+        let should_keep_alive_response = match &http_version {
+            HttpVersion::Http10 | HttpVersion::Http09 => false,
+            HttpVersion::Http11 => {
+                // Check if client sent Connection: close
+                connection_header.as_ref().map(|h| h.to_lowercase() != "close").unwrap_or(true)
+            }
+        };
+
+        // Handle file serving with caching
+        let file_result = secure_file_server.serve_file_with_domain_and_caching(
+            path,
+            Some(&server_name),
+            &request,
+            &http_version,
+            should_keep_alive_response
+        );
+
+        // Convert error to string to make it Send
+        let file_result = file_result.map_err(|e| format!("Error serving file: {}", e));
+
+        match file_result {
+            Ok(Some(response_bytes)) => {
+                // This is a complete HTTP response (with caching headers)
+                println!("🔍 Serving {} bytes over async HTTPS", response_bytes.len());
+
+                // Write in chunks to handle large files properly with tokio-rustls
+                let chunk_size = 8192; // 8KB chunks
+                let mut offset = 0;
+                let mut retry_count = 0;
+                const MAX_RETRIES: u32 = 3;
+
+                while offset < response_bytes.len() {
+                    let end = std::cmp::min(offset + chunk_size, response_bytes.len());
+                    let chunk = &response_bytes[offset..end];
+
+                    // Log progress for large files
+                    if response_bytes.len() > 100000 && offset % (chunk_size * 10) == 0 {
+                        println!("🔍 HTTPS progress: {}/{} bytes ({}%)",
+                            offset, response_bytes.len(),
+                            (offset * 100) / response_bytes.len());
+                    }
+
+                    // Try to write the chunk with retry logic
+                    let mut write_success = false;
+                    for attempt in 0..MAX_RETRIES {
+                        match tls_stream.write_all(chunk).await {
+                            Ok(_) => {
+                                // Successfully wrote the chunk
+                                offset = end;
+                                write_success = true;
+                                retry_count = 0; // Reset retry count on success
+                                break;
+                            }
+                            Err(e) => {
+                                retry_count += 1;
+                                eprintln!("Error writing chunk at offset {} (attempt {}): {}", offset, attempt + 1, e);
+
+                                if attempt < MAX_RETRIES - 1 {
+                                    // Wait a bit before retrying
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                } else {
+                                    return Err(e.into());
+                                }
+                            }
+                        }
+                    }
+
+                    if !write_success {
+                        return Err("Failed to write chunk after maximum retries".into());
+                    }
+
+                    // Flush after each chunk to ensure data is sent
+                    if let Err(e) = tls_stream.flush().await {
+                        eprintln!("Error flushing after chunk at offset {}: {}", offset, e);
+                        return Err(e.into());
+                    }
+                }
+
+                println!("🔍 Successfully served {} bytes over async HTTPS", response_bytes.len());
+            }
+            Ok(None) => {
+                // File not found - check if this is a root request (index.html missing)
+                if secure_file_server.is_root_request(path) {
+                    // Serve default informational page
+                    let default_page = secure_file_server.generate_default_page(&server_name);
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                        default_page.len(), default_page);
+                    tls_stream.write_all(response.as_bytes()).await?;
+                    tls_stream.flush().await?;
+                } else {
+                    // 404 Not Found
+                    let response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\n404 Not Found";
+                    tls_stream.write_all(response.as_bytes()).await?;
+                    tls_stream.flush().await?;
+                }
+            }
+            Err(error_msg) => {
+                eprintln!("{}", error_msg);
+                let response = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 21\r\n\r\n500 Internal Server Error";
+                let response_bytes = response.as_bytes().to_vec();
+                tls_stream.write_all(&response_bytes).await?;
+                tls_stream.flush().await?;
+            }
+        }
+
+        // Return HTTP version and connection header
+        Ok((http_version, connection_header))
     }
 
     /// Handle HTTPS connection in blocking context (for rustls compatibility)
@@ -1626,7 +1887,9 @@ impl OnDemandHttpsServer {
 
                    // Handle HTTP-01 ACME challenges
                    if first_line.starts_with("GET /.well-known/acme-challenge/") {
-                       return Self::handle_acme_challenge_static(stream, conn, first_line, &None, http_challenges);
+                       Self::handle_acme_challenge_static(stream, conn, first_line, &None, http_challenges)?;
+                       // ACME challenges don't need Keep-Alive, always close
+                       return Ok((HttpVersion::Http11, Some("close".to_string())));
                    }
         }
 
@@ -1657,7 +1920,8 @@ impl OnDemandHttpsServer {
         #[cfg(feature = "extensions")]
         {
             if request_path.starts_with("/comment_") || request_path.starts_with("/math_") || request_path.starts_with("/example_") {
-                return Self::handle_admin_request_https(stream, conn, request_path, &lines, extension_registry);
+                Self::handle_admin_request_https(stream, conn, request_path, &lines, extension_registry)?;
+                return Ok((http_version.clone(), connection_header.clone()));
             }
         }
 
@@ -1708,7 +1972,7 @@ impl OnDemandHttpsServer {
                     conn.writer().write_all(response_body.as_bytes())?;
                     conn.write_tls(stream)?;
                     conn.complete_io(stream)?;
-                    return Ok(());
+                    return Ok((http_version.clone(), connection_header.clone()));
                 }
                 Err(e) => {
                     let error_msg = format!("Error: {}", e);
@@ -1722,7 +1986,7 @@ impl OnDemandHttpsServer {
                     conn.writer().write_all(&response_bytes)?;
                     conn.write_tls(stream)?;
                     conn.complete_io(stream)?;
-                    return Ok(());
+                    return Ok((http_version.clone(), connection_header.clone()));
                 }
             }
         }
@@ -1737,9 +2001,26 @@ impl OnDemandHttpsServer {
         ) {
             Ok(Some(response_bytes)) => {
                 // This is a complete HTTP response (with caching headers)
+                // Try to write the entire response at once
                 conn.writer().write_all(&response_bytes)?;
-                conn.write_tls(stream)?;
-                conn.complete_io(stream)?;
+
+                // Complete TLS I/O in a loop to handle large responses
+                loop {
+                    match conn.write_tls(stream) {
+                        Ok(0) => break, // No more data to write
+                        Ok(_) => {
+                            // More data written, continue
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            // Would block, try again
+                                    continue;
+                                }
+                                Err(e) => return Err(e.into()),
+                            }
+                        }
+
+                // Complete any remaining I/O
+                    conn.complete_io(stream)?;
             }
             Ok(None) => {
                 // File not found - check if this is a root request (index.html missing)
@@ -1843,6 +2124,8 @@ impl OnDemandHttpsServer {
                    if first_line.starts_with("GET /.well-known/acme-challenge/") {
                        return Self::handle_acme_challenge(stream, conn, first_line, &self.acme_client, http_challenges);
                    }
+        }
+
         // Extract the request path from the HTTP request
         let request_path = if let Some(first_line) = lines.first() {
             if let Some(path_start) = first_line.find(' ') {
@@ -1860,57 +2143,20 @@ impl OnDemandHttpsServer {
 
         println!("Requested path: {}", request_path);
 
-        }
-        // Try to serve the requested file using secure file server with domain-specific document root
-        let request_path = "/"; // Default to root path
-        match self.secure_file_server.serve_file_with_domain(request_path, Some(server_name)) {
-            Ok(Some(file_content)) => {
-                // Successfully served a file
-                match self.secure_file_server.generate_http_response(request_path, file_content.as_slice()) {
-                    Ok(response_headers) => {
-                        // Write headers first
-                        conn.writer().write_all(response_headers.as_bytes())?;
-                        conn.write_tls(stream)?;
-
-                        // Write content in chunks with proper partial write handling
-                        const CHUNK_SIZE: usize = 8192; // 8KB chunks
-                        let mut offset = 0;
-                        while offset < file_content.len() {
-                            let chunk_end = std::cmp::min(offset + CHUNK_SIZE, file_content.len());
-                            let chunk = &file_content[offset..chunk_end];
-
-                            // Handle partial writes properly
-                            let mut written = 0;
-                            while written < chunk.len() {
-                                match conn.writer().write(&chunk[written..]) {
-                                    Ok(n) => {
-                                        written += n;
-                                        if written < chunk.len() {
-                                            // Partial write, try to flush and continue
-                                            conn.write_tls(stream)?;
-                                        }
-                                    }
-                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                        // Would block, try to flush and retry
-                                        conn.write_tls(stream)?;
-                                        continue;
-                                    }
-                                    Err(e) => return Err(e.into()),
-                                }
-                            }
-
-                            offset = chunk_end;
-                        }
-
-                        // Final flush and complete I/O
+        // Try to serve the requested file using secure file server with caching support
+        match self.secure_file_server.serve_file_with_domain_and_caching(
+            request_path,
+            Some(server_name),
+            &request,
+            &HttpVersion::Http11,
+            false // Default to close for HTTPS
+        ) {
+            Ok(Some(response_bytes)) => {
+                // This is a complete HTTP response (with caching headers)
+                conn.writer().write_all(&response_bytes)?;
                         conn.write_tls(stream)?;
                         conn.complete_io(stream)?;
-                    }
-                    Err(e) => {
-                        println!("Error generating HTTP response: {}", e);
-                        Self::send_error_response(conn, stream, 500, "Internal Server Error")?;
-                    }
-                }
+                return Ok(());
             }
             Ok(None) => {
                 // File not found, send 404
