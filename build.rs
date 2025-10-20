@@ -168,6 +168,17 @@ fn main() -> std::io::Result<()> {
     out.push_str("        self.admin_keys.values().any(|k| k == key)\n");
     out.push_str("    }\n\n");
 
+    out.push_str("    pub fn is_admin_path(&self, path: &str) -> bool {\n");
+    out.push_str("        // Check if the path starts with any admin extension prefix\n");
+    out.push_str("        for ext_name in self.admin_keys.keys() {\n");
+    out.push_str("            let admin_prefix = format!(\"/{}_\", ext_name);\n");
+    out.push_str("            if path.starts_with(&admin_prefix) {\n");
+    out.push_str("                return true;\n");
+    out.push_str("            }\n");
+    out.push_str("        }\n");
+    out.push_str("        false\n");
+    out.push_str("    }\n\n");
+
     out.push_str("    pub fn process_admin_request(&self, path: &str, method: &str, query: &str, body: &str, headers: &std::collections::HashMap<String, String>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {\n");
     out.push_str("        // Process admin request by checking for admin extensions\n");
     out.push_str("        for (ext_name, key) in &self.admin_keys {\n");

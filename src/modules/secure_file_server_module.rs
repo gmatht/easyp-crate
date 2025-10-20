@@ -589,6 +589,19 @@ impl SecureFileServer {
             return Ok(None);
         }
 
+        // Process HTML content for extensions if it's an HTML file
+        if mime_type.starts_with("text/html") {
+            if let Ok(content_string) = String::from_utf8(contents.clone()) {
+                // Process extensions in the HTML content
+                #[cfg(feature = "extensions")]
+                {
+                    // Note: We need access to extension_registry here, but this function doesn't have it
+                    // For now, we'll process extensions in the calling code
+                    println!("DEBUG: HTML file detected, but extension processing needs to be done in calling code");
+                }
+            }
+        }
+
         // Create HTTP response with caching headers
         let mut response = HttpResponse::ok(contents);
         response.set_content_type(&mime_type);

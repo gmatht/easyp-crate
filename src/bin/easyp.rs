@@ -1131,12 +1131,13 @@ impl OnDemandHttpsServer {
         #[cfg(feature = "extensions")]
         {
             println!("DEBUG: Checking for admin request with path: {}", request_path);
-            println!("DEBUG: Admin request check: comment_={}, math_={}, example_={}",
-                request_path.starts_with("/comment_"),
-                request_path.starts_with("/math_"),
-                request_path.starts_with("/example_"));
-            // Check if this looks like an admin request (starts with /comment_, /math_, etc.)
-            if request_path.starts_with("/comment_") || request_path.starts_with("/math_") || request_path.starts_with("/example_") {
+            // Use dynamic admin path checking instead of hardcoded paths
+            let is_admin_request = {
+                let registry = extension_registry.lock().unwrap();
+                registry.is_admin_path(request_path)
+            };
+            println!("DEBUG: Admin request check result: {}", is_admin_request);
+            if is_admin_request {
                 println!("DEBUG: Admin request detected for path: {}", request_path);
 
                 // Extract HTTP method from the first line
@@ -1222,7 +1223,58 @@ impl OnDemandHttpsServer {
         match serve_result {
             Ok(Some(response_bytes)) => {
                 // This is a complete HTTP response (with caching headers)
-                stream.write_all(&response_bytes).await?;
+                // Check if this is HTML content that needs extension processing
+                let final_response_bytes = if let Ok(response_string) = String::from_utf8(response_bytes.clone()) {
+                    println!("DEBUG: Response string length: {}", response_string.len());
+                    println!("DEBUG: Response contains 'text/html': {}", response_string.contains("text/html"));
+                    if response_string.contains("text/html") {
+                        // Check if the HTML body contains #EXTEND: directives
+                        if let Some(body_start) = response_string.find("\r\n\r\n") {
+                            let body = &response_string[body_start + 4..];
+                            println!("DEBUG: Body length: {}", body.len());
+                            println!("DEBUG: Body contains '#EXTEND:': {}", body.contains("#EXTEND:"));
+                            if body.contains("#EXTEND:") {
+                                println!("DEBUG: Found #EXTEND: directive in HTML body, processing extensions...");
+                                // Process extensions in the HTML content
+                                #[cfg(feature = "extensions")]
+                                {
+                                    println!("DEBUG: Extensions feature enabled, calling process_html...");
+                                    let processed_html = extension_registry.lock().unwrap().process_html(body, request_path);
+                                    println!("DEBUG: Extension processing completed, processed HTML length: {}", processed_html.len());
+                                    // Reconstruct the response with processed HTML
+                                    let headers = &response_string[..body_start + 4];
+                                    let new_content_length = processed_html.len();
+                                    // Update Content-Length header
+                                    let updated_headers = response_string
+                                        .lines()
+                                        .map(|line| {
+                                            if line.starts_with("Content-Length:") {
+                                                format!("Content-Length: {}\r\n", new_content_length)
+                                            } else {
+                                                format!("{}\r\n", line)
+                                            }
+                                        })
+                                        .collect::<String>();
+                                    format!("{}{}", updated_headers, processed_html).into_bytes()
+                                }
+                                #[cfg(not(feature = "extensions"))]
+                                {
+                                    response_bytes
+                                }
+                            } else {
+                                response_bytes
+                            }
+                        } else {
+                            response_bytes
+                        }
+                    } else {
+                        response_bytes
+                    }
+                } else {
+                    response_bytes
+                };
+
+                stream.write_all(&final_response_bytes).await?;
                     stream.flush().await?;
             }
             Ok(None) => {
@@ -1491,7 +1543,56 @@ impl OnDemandHttpsServer {
         match file_result {
             Ok(Some(response_bytes)) => {
                 // This is a complete HTTP response (with caching headers)
-                println!("🔍 Serving {} bytes over async HTTPS", response_bytes.len());
+                // Check if this is HTML content that needs extension processing
+                let final_response_bytes = if let Ok(response_string) = String::from_utf8(response_bytes.clone()) {
+                    if response_string.contains("text/html") {
+                        // Check if the HTML body contains #EXTEND: directives
+                        if let Some(body_start) = response_string.find("\r\n\r\n") {
+                            let body = &response_string[body_start + 4..];
+                            println!("DEBUG: Body length: {}", body.len());
+                            println!("DEBUG: Body contains '#EXTEND:': {}", body.contains("#EXTEND:"));
+                            if body.contains("#EXTEND:") {
+                                println!("DEBUG: Found #EXTEND: directive in HTML body, processing extensions...");
+                                // Process extensions in the HTML content
+                                #[cfg(feature = "extensions")]
+                                {
+                                    println!("DEBUG: Extensions feature enabled, calling process_html...");
+                                    let processed_html = extension_registry.lock().unwrap().process_html(body, path);
+                                    println!("DEBUG: Extension processing completed, processed HTML length: {}", processed_html.len());
+                                    // Reconstruct the response with processed HTML
+                                    let headers = &response_string[..body_start + 4];
+                                    let new_content_length = processed_html.len();
+                                    // Update Content-Length header
+                                    let updated_headers = response_string
+                                        .lines()
+                                        .map(|line| {
+                                            if line.starts_with("Content-Length:") {
+                                                format!("Content-Length: {}\r\n", new_content_length)
+                                            } else {
+                                                format!("{}\r\n", line)
+                                            }
+                                        })
+                                        .collect::<String>();
+                                    format!("{}{}", updated_headers, processed_html).into_bytes()
+                                }
+                                #[cfg(not(feature = "extensions"))]
+                                {
+                                    response_bytes
+                                }
+                            } else {
+                                response_bytes
+                            }
+                        } else {
+                            response_bytes
+                        }
+                    } else {
+                        response_bytes
+                    }
+                } else {
+                    response_bytes
+                };
+
+                println!("🔍 Serving {} bytes over async HTTPS", final_response_bytes.len());
 
                 // Write in chunks to handle large files properly with tokio-rustls
                 let chunk_size = 8192; // 8KB chunks
@@ -1499,15 +1600,15 @@ impl OnDemandHttpsServer {
                 let mut retry_count = 0;
                 const MAX_RETRIES: u32 = 3;
 
-                while offset < response_bytes.len() {
-                    let end = std::cmp::min(offset + chunk_size, response_bytes.len());
-                    let chunk = &response_bytes[offset..end];
+                while offset < final_response_bytes.len() {
+                    let end = std::cmp::min(offset + chunk_size, final_response_bytes.len());
+                    let chunk = &final_response_bytes[offset..end];
 
                     // Log progress for large files
-                    if response_bytes.len() > 100000 && offset % (chunk_size * 10) == 0 {
+                    if final_response_bytes.len() > 100000 && offset % (chunk_size * 10) == 0 {
                         println!("🔍 HTTPS progress: {}/{} bytes ({}%)",
-                            offset, response_bytes.len(),
-                            (offset * 100) / response_bytes.len());
+                            offset, final_response_bytes.len(),
+                            (offset * 100) / final_response_bytes.len());
                     }
 
                     // Try to write the chunk with retry logic
@@ -1546,7 +1647,7 @@ impl OnDemandHttpsServer {
                     }
                 }
 
-                println!("🔍 Successfully served {} bytes over async HTTPS", response_bytes.len());
+                println!("🔍 Successfully served {} bytes over async HTTPS", final_response_bytes.len());
             }
             Ok(None) => {
                 // File not found - check if this is a root request (index.html missing)
@@ -1919,7 +2020,11 @@ impl OnDemandHttpsServer {
         // Check for admin extension requests
         #[cfg(feature = "extensions")]
         {
-            if request_path.starts_with("/comment_") || request_path.starts_with("/math_") || request_path.starts_with("/example_") {
+            let is_admin_request = {
+                let registry = extension_registry.lock().unwrap();
+                registry.is_admin_path(request_path)
+            };
+            if is_admin_request {
                 Self::handle_admin_request_https(stream, conn, request_path, &lines, extension_registry)?;
                 return Ok((http_version.clone(), connection_header.clone()));
             }
