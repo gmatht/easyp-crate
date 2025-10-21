@@ -3056,8 +3056,114 @@ fn detect_server_ips() -> Result<Vec<IpAddr>, Box<dyn std::error::Error>> {
         }
     }
 
+    // Get and add public IP addresses
+    if let Ok(public_ips) = get_public_ips() {
+        ip_addresses.extend(public_ips);
+    }
+
     println!("Detected {} IP addresses: {:?}", ip_addresses.len(), ip_addresses);
     Ok(ip_addresses)
+}
+
+/// Get public IPv4 and IPv6 addresses and store them in /var/lib/easyp/ip
+fn get_public_ips() -> Result<Vec<IpAddr>, Box<dyn std::error::Error>> {
+    let ip_file = std::path::Path::new("/var/lib/easyp/ip");
+
+    // Check if we already have stored public IPs
+    if ip_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(ip_file) {
+            let mut stored_ips = Vec::new();
+            for line in content.lines() {
+                if let Ok(ip) = line.parse::<IpAddr>() {
+                    stored_ips.push(ip);
+                }
+            }
+            if !stored_ips.is_empty() {
+                println!("Using stored public IPs: {:?}", stored_ips);
+                return Ok(stored_ips);
+            }
+        }
+    }
+
+    // Get fresh public IPs
+    println!("Fetching public IP addresses...");
+    let mut public_ips = Vec::new();
+
+    // Get public IPv4
+    if let Ok(ipv4) = get_public_ipv4() {
+        public_ips.push(IpAddr::V4(ipv4));
+        println!("Public IPv4: {}", ipv4);
+    }
+
+    // Get public IPv6
+    if let Ok(ipv6) = get_public_ipv6() {
+        public_ips.push(IpAddr::V6(ipv6));
+        println!("Public IPv6: {}", ipv6);
+    }
+
+    // Store the public IPs for future use
+    if !public_ips.is_empty() {
+        if let Some(parent) = ip_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let content = public_ips.iter()
+            .map(|ip| ip.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Err(e) = std::fs::write(ip_file, content) {
+            println!("Warning: Could not store public IPs: {}", e);
+        } else {
+            println!("Stored public IPs in /var/lib/easyp/ip");
+        }
+    }
+
+    Ok(public_ips)
+}
+
+/// Get public IPv4 address using external service
+fn get_public_ipv4() -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
+    // Try multiple services for reliability
+    let services = [
+        "https://ipv4.icanhazip.com",
+        "https://api.ipify.org",
+        "https://checkip.amazonaws.com",
+    ];
+
+    for service in &services {
+        if let Ok(response) = minreq::get(*service).send() {
+            if let Ok(body) = response.as_str() {
+                let ip_str = body.trim();
+                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                    return Ok(ip);
+                }
+            }
+        }
+    }
+
+    Err("Could not determine public IPv4 address".into())
+}
+
+/// Get public IPv6 address using external service
+fn get_public_ipv6() -> Result<Ipv6Addr, Box<dyn std::error::Error>> {
+    // Try multiple services for reliability
+    let services = [
+        "https://ipv6.icanhazip.com",
+        "https://api64.ipify.org",
+        "https://v6.ident.me",
+    ];
+
+    for service in &services {
+        if let Ok(response) = minreq::get(*service).send() {
+            if let Ok(body) = response.as_str() {
+                let ip_str = body.trim();
+                if let Ok(ip) = ip_str.parse::<Ipv6Addr>() {
+                    return Ok(ip);
+                }
+            }
+        }
+    }
+
+    Err("Could not determine public IPv6 address".into())
 }
 
 /// Parse comma-separated IP addresses
