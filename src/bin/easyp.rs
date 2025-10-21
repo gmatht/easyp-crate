@@ -607,7 +607,17 @@ impl OnDemandHttpsServer {
         });
 
                #[cfg(target_os = "redox")]
-               let allowed_ips = Vec::new(); //STUB
+               let allowed_ips = if let Some(ips_str) = &args.allowed_ips {
+                   parse_allowed_ips(ips_str)?
+               } else {
+                   println!("[{}] No allowed IPs specified, using public IPs for Redox...",
+                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+                   // For Redox, only use public IPs since we can't detect local network interfaces
+                   get_public_ips().unwrap_or_else(|e| {
+                       println!("Warning: Could not detect public IPs ({}), using empty list", e);
+                       Vec::new()
+                   })
+               };
                // Parse allowed IP addresses or auto-detect
                #[cfg(not(target_os = "redox"))]
                let allowed_ips = if let Some(ips_str) = &args.allowed_ips {

@@ -61,6 +61,7 @@ minreq = { path = "../minreq" }
 
 [target.'cfg(target_os = "redox")'.dependencies]
 libc = "0.2"
+minreq = { path = "../minreq" }
 
 
 
