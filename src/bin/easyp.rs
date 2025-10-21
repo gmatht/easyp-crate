@@ -1242,33 +1242,67 @@ impl OnDemandHttpsServer {
                             println!("DEBUG: Body length: {}", body.len());
                             println!("DEBUG: Body contains '#EXTEND:': {}", body.contains("#EXTEND:"));
                             if body.contains("#EXTEND:") {
-                                println!("DEBUG: Found #EXTEND: directive in HTML body, processing extensions...");
-                                // Process extensions in the HTML content
-                                #[cfg(feature = "extensions")]
-                                {
-                                    println!("DEBUG: Extensions feature enabled, calling process_html...");
-                                    let processed_html = extension_registry.lock().unwrap().process_html(body, request_path);
-                                    println!("DEBUG: Extension processing completed, processed HTML length: {}", processed_html.len());
-                                    // Reconstruct the response with processed HTML
-                                    let headers = &response_string[..body_start];
-                                    let new_content_length = processed_html.len();
-                                    // Update Content-Length header
-                                    let updated_headers = headers
-                                        .lines()
-                                        .map(|line| {
-                                            if line.starts_with("Content-Length:") {
-                                                format!("Content-Length: {}", new_content_length)
-                                            } else {
-                                                line.to_string()
-                                            }
-                                        })
-                                        .collect::<Vec<String>>()
-                                        .join("\r\n");
-                                    format!("{}\r\n\r\n{}", updated_headers, processed_html).into_bytes()
-                                }
-                                #[cfg(not(feature = "extensions"))]
-                                {
-                                    response_bytes
+                                println!("DEBUG: Found #EXTEND: directive in HTML body, checking for constant extensions...");
+
+                                // Check if this page only contains constant extensions
+                                let has_constant_extensions_only = check_constant_extensions_only(body);
+
+                                if has_constant_extensions_only {
+                                    println!("DEBUG: Only constant extensions found, processing without breaking cache...");
+                                    // Process extensions but keep the original cache headers
+                                    #[cfg(feature = "extensions")]
+                                    {
+                                        let processed_html = extension_registry.lock().unwrap().process_html(body, request_path);
+                                        // Reconstruct response but preserve original cache headers
+                                        let headers = &response_string[..body_start + 4];
+                                        let new_content_length = processed_html.len();
+                                        // Update Content-Length header but keep cache headers intact
+                                        let updated_headers = headers
+                                            .lines()
+                                            .map(|line| {
+                                                if line.starts_with("Content-Length:") {
+                                                    format!("Content-Length: {}", new_content_length)
+                                                } else {
+                                                    line.to_string()
+                                                }
+                                            })
+                                            .collect::<Vec<String>>()
+                                            .join("\r\n");
+                                        format!("{}\r\n{}", updated_headers, processed_html).into_bytes()
+                                    }
+                                    #[cfg(not(feature = "extensions"))]
+                                    {
+                                        response_bytes
+                                    }
+                                } else {
+                                    println!("DEBUG: Dynamic extensions found, processing with no-cache headers...");
+                                    // Process extensions and add no-cache headers for dynamic content
+                                    #[cfg(feature = "extensions")]
+                                    {
+                                        let processed_html = extension_registry.lock().unwrap().process_html(body, request_path);
+                                        // Reconstruct response with no-cache headers
+                                        let headers = &response_string[..body_start + 4];
+                                        let new_content_length = processed_html.len();
+                                        // Update headers and add no-cache
+                                        let updated_headers = headers
+                                            .lines()
+                                            .map(|line| {
+                                                if line.starts_with("Content-Length:") {
+                                                    format!("Content-Length: {}", new_content_length)
+                                                } else if line.starts_with("Cache-Control:") {
+                                                    "Cache-Control: no-cache, no-store, must-revalidate".to_string()
+                                                } else {
+                                                    line.to_string()
+                                                }
+                                            })
+                                            .collect::<Vec<String>>()
+                                            .join("\r\n");
+                                        format!("{}\r\n{}", updated_headers, processed_html).into_bytes()
+                                    }
+                                    #[cfg(not(feature = "extensions"))]
+                                    {
+                                        response_bytes
+                                    }
                                 }
                             } else {
                                 response_bytes
@@ -1511,19 +1545,78 @@ impl OnDemandHttpsServer {
             }
         }
 
-        // Handle extensions
-        if path.starts_with("/extensions/") {
-            let ext_name = path.trim_start_matches("/extensions/");
-            let ext_content = {
+        // Check for admin extension requests
+        #[cfg(feature = "extensions")]
+        {
+            println!("DEBUG: Async HTTPS - Checking for admin request with path: {}", path);
+            let is_admin_request = {
                 let registry = extension_registry.lock().unwrap();
-                registry.admin_keys.get(ext_name).cloned()
+                registry.is_admin_path(path)
             };
-            if let Some(ext) = ext_content {
-                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    ext.len(), ext);
-                tls_stream.write_all(response.as_bytes()).await?;
-                tls_stream.flush().await?;
-                return Ok((http_version.clone(), Some("close".to_string())));
+            println!("DEBUG: Async HTTPS - Admin request check result: {}", is_admin_request);
+            if is_admin_request {
+                println!("DEBUG: Async HTTPS - Admin request detected for path: {}", path);
+
+                // Extract HTTP method
+                let http_method = method;
+
+                // Extract query string
+                let query_string = if let Some(query_start) = path.find('?') {
+                    &path[query_start + 1..]
+                } else {
+                    ""
+                };
+
+                // Extract the path without query string
+                let admin_path = if let Some(query_start) = path.find('?') {
+                    &path[..query_start]
+                } else {
+                    path
+                };
+
+                // Parse headers
+                let mut headers = std::collections::HashMap::new();
+                for line in lines.iter().skip(1) {
+                    if let Some(colon_pos) = line.find(':') {
+                        let key = line[..colon_pos].trim().to_lowercase();
+                        let value = line[colon_pos + 1..].trim().to_string();
+                        headers.insert(key, value);
+                    }
+                }
+
+                // Read request body if present
+                let body = if let Some(content_length_line) = lines.iter().find(|line| line.to_lowercase().starts_with("content-length:")) {
+                    if let Some(length_str) = content_length_line.split(':').nth(1) {
+                        if let Ok(length) = length_str.trim().parse::<usize>() {
+                            let mut body_buffer = vec![0u8; length];
+                            tls_stream.read_exact(&mut body_buffer).await?;
+                            String::from_utf8_lossy(&body_buffer).to_string()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+
+                // Handle admin extension request
+                let admin_response = extension_registry.lock().unwrap().process_admin_request(admin_path, http_method, query_string, &body, &headers);
+                match admin_response {
+                    Ok(response) => {
+                        tls_stream.write_all(response.as_bytes()).await?;
+                        tls_stream.flush().await?;
+                        return Ok((http_version.clone(), Some("close".to_string())));
+                    }
+                    Err(e) => {
+                        let error_response = format!("HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nError: {}",
+                            e.to_string().len() + 7, e);
+                        tls_stream.write_all(error_response.as_bytes()).await?;
+                        tls_stream.flush().await?;
+                        return Ok((http_version.clone(), Some("close".to_string())));
+                    }
+                }
             }
         }
 
@@ -2030,11 +2123,14 @@ impl OnDemandHttpsServer {
         // Check for admin extension requests
         #[cfg(feature = "extensions")]
         {
+            println!("DEBUG: HTTPS - Checking for admin request with path: {}", request_path);
             let is_admin_request = {
                 let registry = extension_registry.lock().unwrap();
                 registry.is_admin_path(request_path)
             };
+            println!("DEBUG: HTTPS - Admin request check result: {}", is_admin_request);
             if is_admin_request {
+                println!("DEBUG: HTTPS - Admin request detected for path: {}", request_path);
                 Self::handle_admin_request_https(stream, conn, request_path, &lines, extension_registry)?;
                 return Ok((http_version.clone(), connection_header.clone()));
             }
@@ -2982,19 +3078,18 @@ fn parse_allowed_ips(ips_str: &str) -> Result<Vec<IpAddr>, Box<dyn std::error::E
 }
 
 /// Get admin keys from the admin_keys file
-fn get_admin_keys() -> Result<std::collections::HashMap<String, String>, Box<dyn std::error::Error>> {
+fn get_admin_keys() -> Result<std::collections::HashSet<String>, Box<dyn std::error::Error>> {
     let admin_keys_file = std::path::Path::new("/var/lib/easyp/admin_keys");
-    let mut admin_keys = std::collections::HashMap::new();
+    let mut admin_keys = std::collections::HashSet::new();
+
+    println!("DEBUG: Checking admin keys file: {:?}", admin_keys_file);
+    println!("DEBUG: File exists: {}", admin_keys_file.exists());
 
     if admin_keys_file.exists() {
         if let Ok(content) = std::fs::read_to_string(admin_keys_file) {
             for line in content.lines() {
-                // Format is: extension_name_key (e.g., comment_71f8732b179e9339)
-                // We need the full key including the underscore
-                if let Some(underscore_pos) = line.find('_') {
-                    let ext_name = &line[..underscore_pos];
-                    let full_key = &line[underscore_pos..]; // Include the underscore in the key
-                    admin_keys.insert(ext_name.to_string(), full_key.to_string());
+                if !line.is_empty() {
+                    admin_keys.insert(line.to_string());
                 }
             }
         }
@@ -3064,23 +3159,145 @@ fn get_domains(cache_dir: &str) -> Result<Vec<String>, Box<dyn std::error::Error
     Ok(domains)
 }
 
+/// Check if HTML body contains only constant extensions
+/// Constant extensions are those that produce the same output for the same URL
+fn check_constant_extensions_only(body: &str) -> bool {
+    // List of known constant extensions
+    // These extensions produce the same output for a given URL and can be cached
+    let constant_extensions = [
+        "comment",      // Comment system - same form for same URL
+        "math",         // Math extension - deterministic calculations
+        "example",      // Example extension - static content
+    ];
+
+    // List of known dynamic extensions
+    // These extensions may produce different output and should not be cached
+    let dynamic_extensions = [
+        "time",         // Time-based content
+        "random",       // Random content
+        "counter",      // Counter that increments
+    ];
+
+    // Find all #EXTEND: directives in the body
+    let mut start = 0;
+    while let Some(extend_pos) = body[start..].find("#EXTEND:") {
+        let full_pos = start + extend_pos;
+
+        // Find the end of the directive
+        if let Some(end_pos) = body[full_pos..].find(')') {
+            let directive = &body[full_pos..full_pos + end_pos + 1];
+
+            // Extract extension name
+            if let Some(colon_pos) = directive.find(':') {
+                let after_colon = &directive[colon_pos + 1..];
+                if let Some(paren_pos) = after_colon.find('(') {
+                    let ext_name = &after_colon[..paren_pos];
+
+                    // Check if this is a dynamic extension
+                    if dynamic_extensions.contains(&ext_name) {
+                        println!("DEBUG: Found dynamic extension: {}", ext_name);
+                        return false;
+                    }
+
+                    // If it's not in our constant list, assume it's dynamic for safety
+                    if !constant_extensions.contains(&ext_name) {
+                        println!("DEBUG: Unknown extension '{}', assuming dynamic", ext_name);
+                        return false;
+                    }
+                }
+            }
+        }
+
+        start = full_pos + 1;
+    }
+
+    println!("DEBUG: Only constant extensions found");
+    true
+}
+
 /// Print admin URLs for all domains and admin keys
 fn print_admin_urls(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let admin_keys = get_admin_keys()?;
+    let mut admin_keys = get_admin_keys()?;
     let domains = get_domains(&args.cache_dir)?;
 
+    // Generate keys for any missing extensions
+    let available_extensions = get_available_admin_extensions()?;
+    println!("DEBUG: Available extensions: {:?}", available_extensions);
+    println!("DEBUG: Current admin keys: {:?}", admin_keys.iter().collect::<Vec<_>>());
+    let mut needs_update = false;
+
+    for ext_name in available_extensions {
+        // Check if any admin path for this extension already exists
+        let has_existing_key = admin_keys.iter().any(|key| key.starts_with(&format!("{}_", ext_name)));
+        if !has_existing_key {
+            println!("Generating admin key for missing extension: {}", ext_name);
+            let key_suffix = generate_admin_key_for_extension(&ext_name);
+            let admin_path = format!("{}_{}", ext_name, key_suffix);
+            admin_keys.insert(admin_path);
+            needs_update = true;
+        }
+    }
+
+    if needs_update {
+        save_admin_keys(&admin_keys)?;
+    }
+
     if admin_keys.is_empty() {
-        println!("No admin keys found in /var/lib/easyp/admin_keys");
+        println!("No admin keys found or generated");
         return Ok(());
     }
 
     println!("Admin URLs:");
     for domain in domains {
-        for (ext_name, key) in &admin_keys {
-            let admin_url = format!("https://{}/{}{}", domain, ext_name, key);
+        for admin_path in &admin_keys {
+            let admin_url = format!("https://{}/{}", domain, admin_path);
             println!("{}", admin_url);
         }
     }
+
+    Ok(())
+}
+
+/// Get list of available admin extensions from compiled-in extensions
+fn get_available_admin_extensions() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    // Return the list of extensions that are compiled into the binary
+    // This matches what's in the generated_extensions.rs file
+    Ok(vec![
+        "comment".to_string(),
+        "upload".to_string(),
+        "stats".to_string(),
+        "all".to_string(),
+    ])
+}
+
+/// Generate a unique admin key for a specific extension
+fn generate_admin_key_for_extension(ext_name: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    std::time::SystemTime::now().hash(&mut hasher);
+    ext_name.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Save admin keys to file
+fn save_admin_keys(admin_keys: &std::collections::HashSet<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let admin_keys_file = std::path::Path::new("/var/lib/easyp/admin_keys");
+
+    // Create parent directory if it doesn't exist
+    if let Some(parent) = admin_keys_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut content = String::new();
+    for k in admin_keys {
+        // Save keys in the correct format (extension_key)
+        content.push_str(&format!("{}\n", k));
+    }
+
+    std::fs::write(admin_keys_file, content)?;
+    println!("Admin keys saved to file");
 
     Ok(())
 }

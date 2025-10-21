@@ -4,6 +4,7 @@
 //! file serving, security, and protocol support.
 
 pub mod connection_policy;
+pub mod extension_traits;
 pub mod file_cache;
 pub mod file_handler;
 pub mod http_response;

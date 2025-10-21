@@ -112,17 +112,19 @@ fn main() -> std::io::Result<()> {
 
     // Generate ExtensionRegistry
     out.push_str("pub struct ExtensionRegistry {\n");
-    out.push_str("    admin_keys: std::collections::HashMap<String, String>,\n");
+    out.push_str("    admin_keys: std::collections::HashSet<String>,\n");
     out.push_str("}\n\n");
 
     out.push_str("impl ExtensionRegistry {\n");
     out.push_str("    pub fn new() -> Self {\n");
     out.push_str("        let mut registry = Self {\n");
-    out.push_str("            admin_keys: std::collections::HashMap::new(),\n");
+    out.push_str("            admin_keys: std::collections::HashSet::new(),\n");
     out.push_str("        };\n");
     out.push_str("        // Load admin keys on initialization\n");
     out.push_str("        let _ = registry.load_existing_admin_keys();\n");
+    out.push_str("        println!(\"DEBUG: After loading, admin keys: {:?}\", registry.admin_keys.iter().collect::<Vec<_>>());\n");
     out.push_str("        let _ = registry.generate_missing_admin_keys();\n");
+    out.push_str("        println!(\"DEBUG: After generation, admin keys: {:?}\", registry.admin_keys.iter().collect::<Vec<_>>());\n");
     out.push_str("        registry\n");
     out.push_str("    }\n\n");
 
@@ -166,14 +168,14 @@ fn main() -> std::io::Result<()> {
     out.push_str("    }\n\n");
 
     out.push_str("    pub fn is_valid_admin_key(&self, key: &str) -> bool {\n");
-    out.push_str("        self.admin_keys.values().any(|k| k == key)\n");
+    out.push_str("        self.admin_keys.contains(key)\n");
     out.push_str("    }\n\n");
 
     out.push_str("    pub fn is_admin_path(&self, path: &str) -> bool {\n");
-    out.push_str("        // Check if the path starts with any admin extension prefix\n");
-    out.push_str("        for ext_name in self.admin_keys.keys() {\n");
-    out.push_str("            let admin_prefix = format!(\"/{}_\", ext_name);\n");
-    out.push_str("            if path.starts_with(&admin_prefix) {\n");
+    out.push_str("        // Check if the path starts with any admin extension path\n");
+    out.push_str("        for admin_path in &self.admin_keys {\n");
+    out.push_str("            let full_path = format!(\"/{}\", admin_path);\n");
+    out.push_str("            if path.starts_with(&full_path) {\n");
     out.push_str("                return true;\n");
     out.push_str("            }\n");
     out.push_str("        }\n");
@@ -182,15 +184,15 @@ fn main() -> std::io::Result<()> {
 
     out.push_str("    pub fn process_admin_request(&self, path: &str, method: &str, query: &str, body: &str, headers: &std::collections::HashMap<String, String>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {\n");
     out.push_str("        // Process admin request by checking for admin extensions\n");
-    out.push_str("        for (ext_name, key) in &self.admin_keys {\n");
-    out.push_str("            let admin_prefix = format!(\"/{}_\", ext_name);\n");
+    out.push_str("        for admin_path in &self.admin_keys {\n");
+    out.push_str("            let full_path = format!(\"/{}\", admin_path);\n");
     out.push_str(
-        "            println!(\"DEBUG: Checking prefix {} with key {}\", admin_prefix, key);\n",
+        "            println!(\"DEBUG: Checking path {}\", full_path);\n",
     );
-    out.push_str("            if path.starts_with(&admin_prefix) {\n");
-    out.push_str("                // Dynamically call the appropriate admin handler\n");
-    out.push_str("                let handler_name = format!(\"{}_admin::handle_{}_admin_request\", ext_name, ext_name);\n");
-    out.push_str("                return match ext_name.as_str() {\n");
+    out.push_str("            if path.starts_with(&full_path) {\n");
+    out.push_str("                // Extract extension name from admin path\n");
+    out.push_str("                let ext_name = admin_path.split('_').next().unwrap_or(\"\");\n");
+    out.push_str("                return match ext_name {\n");
 
     // Generate match arms for each .admin.rs file
     if let Ok(entries) = std::fs::read_dir("extensions") {
@@ -199,8 +201,17 @@ fn main() -> std::io::Result<()> {
                 if file_name.ends_with(".admin.rs") {
                     let ext_name = file_name.replace(".admin.rs", "");
                     out.push_str(&format!("                    \"{}\" => {{\n", ext_name));
+                    out.push_str("                        // Convert HashSet to HashMap for admin extension functions\n");
+                    out.push_str("                        let mut admin_keys_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();\n");
+                    out.push_str("                        for admin_path in &self.admin_keys {\n");
+                    out.push_str("                            if let Some(underscore_pos) = admin_path.find('_') {\n");
+                    out.push_str("                                let ext_name = &admin_path[..underscore_pos];\n");
+                    out.push_str("                                let key = &admin_path[underscore_pos + 1..];\n");
+                    out.push_str("                                admin_keys_map.insert(ext_name.to_string(), key.to_string());\n");
+                    out.push_str("                            }\n");
+                    out.push_str("                        }\n");
                     out.push_str(&format!(
-                        "                        {}_admin::handle_{}_admin_request(path, method, query, body, headers, &self.admin_keys)\n",
+                        "                        {}_admin::handle_{}_admin_request(path, method, query, body, headers, &admin_keys_map)\n",
                         ext_name, ext_name
                     ));
                     out.push_str("                            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)\n");
@@ -228,10 +239,16 @@ fn main() -> std::io::Result<()> {
     out.push_str("        if admin_keys_file.exists() {\n");
     out.push_str("            if let Ok(content) = std::fs::read_to_string(admin_keys_file) {\n");
     out.push_str("                for line in content.lines() {\n");
-    out.push_str("                    if let Some((key, value)) = line.split_once('_') {\n");
+    out.push_str("                    if !line.is_empty() {\n");
+    out.push_str("                        let admin_key = if line.contains(\"__\") {\n");
+    out.push_str("                            line.replace(\"__\", \"_\")\n");
+    out.push_str("                        } else {\n");
+    out.push_str("                            line.to_string()\n");
+    out.push_str("                        };\n");
     out.push_str(
-        "                        self.admin_keys.insert(key.to_string(), value.to_string());\n",
+        "                        self.admin_keys.insert(admin_key.clone());\n",
     );
+    out.push_str("                        println!(\"DEBUG: Loaded admin key: {}\", admin_key);\n");
     out.push_str("                    }\n");
     out.push_str("                }\n");
     out.push_str("            }\n");
@@ -253,14 +270,23 @@ fn main() -> std::io::Result<()> {
     out.push_str(
         "                        let ext_name = file_name.replace(\".admin.rs\", \"\");\n",
     );
-    out.push_str("                        if !self.admin_keys.contains_key(&ext_name) {\n");
+    out.push_str("                        // Check if any admin path for this extension already exists\n");
+    out.push_str("                        let prefix = format!(\"{}_{}\", ext_name, \"\");\n");
+    out.push_str("                        println!(\"DEBUG: Checking prefix: {}\", prefix);\n");
+    out.push_str("                        for key in self.admin_keys.iter() {\n");
+    out.push_str("                            println!(\"DEBUG: Existing key: {}\", key);\n");
+    out.push_str("                        }\n");
+    out.push_str("                        let has_existing_key = self.admin_keys.iter().any(|key| key.starts_with(&prefix));\n");
+    out.push_str("                        println!(\"DEBUG: Has existing key for {}: {}\", ext_name, has_existing_key);\n");
+    out.push_str("                        if !has_existing_key {\n");
     out.push_str("                            use std::collections::hash_map::DefaultHasher;\n");
     out.push_str("                            use std::hash::{Hash, Hasher};\n");
     out.push_str("                            let mut hasher = DefaultHasher::new();\n");
     out.push_str("                            std::time::SystemTime::now().hash(&mut hasher);\n");
     out.push_str("                            ext_name.hash(&mut hasher);\n");
-    out.push_str("                            let key = format!(\"{:016x}\", hasher.finish());\n");
-    out.push_str("                            self.admin_keys.insert(ext_name, key);\n");
+    out.push_str("                            let key = format!(\"_{:016x}\", hasher.finish());\n");
+    out.push_str("                            let admin_path = format!(\"{}{}\", ext_name, key);\n");
+    out.push_str("                            self.admin_keys.insert(admin_path);\n");
     out.push_str("                            needs_save = true;\n");
     out.push_str("                        }\n");
     out.push_str("                    }\n");
@@ -276,8 +302,8 @@ fn main() -> std::io::Result<()> {
     out.push_str("                let _ = std::fs::create_dir_all(parent);\n");
     out.push_str("            }\n");
     out.push_str("            let mut content = String::new();\n");
-    out.push_str("            for (k, v) in &self.admin_keys {\n");
-    out.push_str("                content.push_str(&format!(\"{}_{}\\n\", k, v));\n");
+    out.push_str("            for k in &self.admin_keys {\n");
+    out.push_str("                content.push_str(&format!(\"{}\\n\", k));\n");
     out.push_str("            }\n");
     out.push_str("            let _ = std::fs::write(admin_keys_file, content);\n");
     out.push_str("        }\n");
@@ -342,3 +368,4 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=extensions");
     Ok(())
 }
+// Force rebuild
