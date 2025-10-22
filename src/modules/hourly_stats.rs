@@ -6,15 +6,41 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::fs;
 use std::path::Path;
-use serde::{Serialize, Deserialize};
 
 /// Single hour's statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct HourlyStats {
     pub timestamp: u64,        // Unix timestamp of the hour
     pub memory_used_mb: f64,   // Memory usage in MB
     pub cpu_usage_percent: f64, // CPU usage percentage
     pub request_count: u64,    // Number of requests in this hour
+}
+
+impl HourlyStats {
+    /// Serialize to TSV format (tab-separated values)
+    fn to_tsv(&self) -> String {
+        format!("{}\t{}\t{}\t{}",
+            self.timestamp,
+            self.memory_used_mb,
+            self.cpu_usage_percent,
+            self.request_count
+        )
+    }
+
+    /// Deserialize from TSV format
+    fn from_tsv_line(line: &str) -> Option<Self> {
+        let parts: Vec<&str> = line.trim().split('\t').collect();
+        if parts.len() == 4 {
+            Some(HourlyStats {
+                timestamp: parts[0].parse().ok()?,
+                memory_used_mb: parts[1].parse().ok()?,
+                cpu_usage_percent: parts[2].parse().ok()?,
+                request_count: parts[3].parse().ok()?,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 /// Statistics collector that maintains 48 hours of data
@@ -282,21 +308,19 @@ impl HourlyStatsCollector {
         Ok(usage)
     }
 
-    /// Save statistics to disk in JSONL format for easier appending
+    /// Save statistics to disk in TSV format
     fn save_stats(&self) -> Result<(), String> {
         let stats = self.stats.lock()
             .map_err(|e| format!("Failed to lock stats: {}", e))?;
 
-        // Convert to JSONL format (one JSON object per line)
-        let mut jsonl = String::new();
+        // Convert to TSV format (one entry per line)
+        let mut tsv = String::new();
         for stat in stats.iter() {
-            let json_line = serde_json::to_string(stat)
-                .map_err(|e| format!("Failed to serialize stat entry: {}", e))?;
-            jsonl.push_str(&json_line);
-            jsonl.push('\n');
+            tsv.push_str(&stat.to_tsv());
+            tsv.push('\n');
         }
 
-        // Ensure directory exists with better error handling
+        // Ensure directory exists
         if let Some(parent) = Path::new(&self.data_file).parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| {
@@ -305,7 +329,7 @@ impl HourlyStatsCollector {
                 })?;
         }
 
-        fs::write(&self.data_file, jsonl)
+        fs::write(&self.data_file, tsv)
             .map_err(|e| {
                 format!("Failed to write stats file '{}': {} (os error {})",
                        self.data_file, e, e.raw_os_error().unwrap_or(0))
@@ -314,7 +338,7 @@ impl HourlyStatsCollector {
         Ok(())
     }
 
-    /// Load statistics from disk (supports both JSON and JSONL formats)
+    /// Load statistics from disk (TSV format)
     fn load_stats(&self) -> Result<(), String> {
         if !Path::new(&self.data_file).exists() {
             return Ok(()); // No existing data
@@ -326,32 +350,16 @@ impl HourlyStatsCollector {
         let mut stats = self.stats.lock()
             .map_err(|e| format!("Failed to lock stats: {}", e))?;
 
-        // Try to parse as JSONL first (new format)
-        let mut jsonl_success = false;
+        // Parse TSV format
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<HourlyStats>(line) {
-                Ok(stat) => {
-                    stats.push_back(stat);
-                    jsonl_success = true;
-                }
-                Err(_) => {
-                    // If any line fails to parse as JSONL, fall back to old JSON format
-                    jsonl_success = false;
-                    break;
-                }
+            if let Some(stat) = HourlyStats::from_tsv_line(line) {
+                stats.push_back(stat);
+            } else {
+                eprintln!("Warning: Failed to parse stats line: {}", line);
             }
-        }
-
-        // If JSONL parsing failed, try old JSON array format for backward compatibility
-        if !jsonl_success {
-            stats.clear(); // Clear any partially loaded data
-            let stats_vec: Vec<HourlyStats> = serde_json::from_str(&content)
-                .map_err(|e| format!("Failed to parse stats file (tried both JSONL and JSON formats): {}", e))?;
-
-            *stats = stats_vec.into_iter().collect();
         }
 
         Ok(())

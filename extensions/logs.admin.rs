@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod file_logger;
 
 // Log entry structure
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 struct LogEntry {
     timestamp: String,
     level: String,
@@ -104,8 +104,12 @@ impl LogStorage {
 }
 
 // Global log storage
-lazy_static::lazy_static! {
-    static ref LOG_STORAGE: Arc<Mutex<LogStorage>> = Arc::new(Mutex::new(LogStorage::new(10000)));
+use std::sync::OnceLock;
+
+static LOG_STORAGE: OnceLock<Arc<Mutex<LogStorage>>> = OnceLock::new();
+
+fn get_log_storage() -> &'static Arc<Mutex<LogStorage>> {
+    LOG_STORAGE.get_or_init(|| Arc::new(Mutex::new(LogStorage::new(10000))))
 }
 
 // Custom logger that captures logs
@@ -131,7 +135,7 @@ impl log::Log for LogCaptureLogger {
             let source = format!("{}:{}", record.file().unwrap_or("unknown"), record.line().unwrap_or(0));
 
             // Add to storage
-            if let Ok(mut storage) = LOG_STORAGE.lock() {
+            if let Ok(mut storage) = get_log_storage().lock() {
                 storage.add_entry(level, message, source);
             }
 
@@ -145,7 +149,7 @@ impl log::Log for LogCaptureLogger {
 
 // Function to add a log entry manually (for non-log crate messages)
 pub fn add_log_entry(level: &str, message: &str, source: &str) {
-    if let Ok(mut storage) = LOG_STORAGE.lock() {
+    if let Ok(mut storage) = get_log_storage().lock() {
         storage.add_entry(level.to_string(), message.to_string(), source.to_string());
     }
 }
@@ -367,7 +371,7 @@ fn generate_logs_panel(admin_key: &str, filter: Option<&str>, level_filter: Opti
     html.push_str("<h1>📋 Server Logs</h1>\n");
 
     // Get log entries from both storage and files
-    let mut all_entries = if let Ok(storage) = LOG_STORAGE.lock() {
+    let mut all_entries = if let Ok(storage) = get_log_storage().lock() {
         storage.get_entries(None, None, None) // Get all entries from storage first
     } else {
         Vec::new()
@@ -415,7 +419,7 @@ fn generate_logs_panel(admin_key: &str, filter: Option<&str>, level_filter: Opti
     let all_entries = filtered_entries;
 
     // Statistics (calculate from all entries before filtering)
-    let mut all_unfiltered_entries = if let Ok(storage) = LOG_STORAGE.lock() {
+    let mut all_unfiltered_entries = if let Ok(storage) = get_log_storage().lock() {
         storage.get_entries(None, None, None)
     } else {
         Vec::new()
@@ -618,7 +622,7 @@ pub fn handle_logs_admin_request(
     // Handle POST requests (clear logs)
     if method == "POST" {
         if body.contains("action=clear") {
-            if let Ok(mut storage) = LOG_STORAGE.lock() {
+            if let Ok(mut storage) = get_log_storage().lock() {
                 storage.entries.clear();
             }
             return Ok("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 22\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST\r\nAccess-Control-Allow-Headers: Content-Type\r\n\r\nLogs cleared successfully".to_string());

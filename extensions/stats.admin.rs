@@ -3,7 +3,6 @@
 
 use std::fs;
 use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
 
 // System memory information structure
 #[derive(Debug)]
@@ -57,7 +56,7 @@ struct DiskUsage {
 }
 
 // Hourly statistics structure (matches the one in hourly_stats.rs)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct HourlyStats {
     timestamp: u64,        // Unix timestamp of the hour
     memory_used_mb: f64,   // Memory usage in MB
@@ -730,11 +729,32 @@ fn load_hourly_stats() -> Result<Vec<HourlyStats>, String> {
         return Ok(Vec::new()); // No data yet
     }
 
-    let json = fs::read_to_string(stats_file)
+    let content = fs::read_to_string(stats_file)
         .map_err(|e| format!("Failed to read stats file: {}", e))?;
 
-    let stats: Vec<HourlyStats> = serde_json::from_str(&json)
-        .map_err(|e| format!("Failed to parse stats JSON: {}", e))?;
+    let mut stats = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.trim().split('\t').collect();
+        if parts.len() == 4 {
+            if let (Ok(timestamp), Ok(memory_used_mb), Ok(cpu_usage_percent), Ok(request_count)) = (
+                parts[0].parse::<u64>(),
+                parts[1].parse::<f64>(),
+                parts[2].parse::<f64>(),
+                parts[3].parse::<u64>(),
+            ) {
+                stats.push(HourlyStats {
+                    timestamp,
+                    memory_used_mb,
+                    cpu_usage_percent,
+                    request_count,
+                });
+            }
+        }
+    }
 
     Ok(stats)
 }
