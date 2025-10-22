@@ -7,6 +7,10 @@ use std::io::{BufRead, BufReader};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Import file logger to get the log file path
+#[path = "../src/modules/file_logger.rs"]
+mod file_logger;
+
 // Log entry structure
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct LogEntry {
@@ -150,13 +154,17 @@ pub fn add_log_entry(level: &str, message: &str, source: &str) {
 fn read_log_files() -> Vec<LogEntry> {
     let mut entries = Vec::new();
 
-    // Common log file locations
+    // Get the actual log file path from the file logger
+    let log_file_path = crate::file_logger::get_log_file_path().unwrap_or_else(|| "/tmp/easyp.log".to_string());
+
+    // Common log file locations to check
     let log_files = [
         "/var/log/easyp/server.log",
         "/var/log/easyp/error.log",
         "server.log",
         "server_error.log",
         "/tmp/easyp.log",
+        &log_file_path, // Add the actual log file path
     ];
 
     for log_file in &log_files {

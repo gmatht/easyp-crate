@@ -18,6 +18,16 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as TokioServerConfig;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+// Import hourly stats collection
+#[path = "../modules/hourly_stats.rs"]
+mod hourly_stats;
+use hourly_stats::{HourlyStatsCollector, start_stats_collection_task};
+
+// Import file logger
+#[path = "../modules/file_logger.rs"]
+mod file_logger;
+use file_logger::{init_file_logger, write_file_log, get_log_file_path};
 use std::time::Duration;
 
 use lexopt::prelude::*;
@@ -35,7 +45,11 @@ impl log::Log for SimpleLogger {
 
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            println!("{}: {}", record.level(), record.args());
+            let log_message = format!("{}: {}", record.level(), record.args());
+            println!("{}", log_message);
+
+            // Also write to file
+            write_file_log(&record.level().to_string(), &record.args().to_string());
         }
     }
 
@@ -514,11 +528,12 @@ struct OnDemandHttpsServer {
     allowed_ips: Vec<IpAddr>, // Store allowed IPs for display
     extension_registry: Arc<Mutex<ExtensionRegistry>>, // Extension system
     secure_file_server: SecureFileServer, // Secure file serving with security features
+    stats_collector: Arc<HourlyStatsCollector>, // Hourly statistics collection
 }
 
 impl OnDemandHttpsServer {
     /// Create a new on-demand HTTPS server
-    async fn new(args: Args) -> Result<Self, Box<dyn std::error::Error>> {
+    async fn new(args: Args, stats_collector: Arc<HourlyStatsCollector>) -> Result<Self, Box<dyn std::error::Error>> {
         // Apply --over-9000 option to port numbers
         let http_port = if args.over_9000 {
             args.http_port + 9000
@@ -834,6 +849,7 @@ impl OnDemandHttpsServer {
                    allowed_ips,
                    extension_registry,
                    secure_file_server,
+                   stats_collector,
                })
     }
 
@@ -944,9 +960,10 @@ impl OnDemandHttpsServer {
                             let http_challenges = self.http_challenges.clone();
                             let extension_registry = self.extension_registry.clone();
                             let secure_file_server = self.secure_file_server.clone();
+                            let stats_collector = self.stats_collector.clone();
 
                             tokio::spawn(async move {
-                                if let Err(e) = Self::handle_connection_static(stream, cert_resolver, args, extension_registry, http_challenges, secure_file_server).await {
+                                if let Err(e) = Self::handle_connection_static(stream, cert_resolver, args, extension_registry, http_challenges, secure_file_server, stats_collector).await {
                                     eprintln!("HTTPS connection error: {}", e);
                                 }
                             });
@@ -1394,6 +1411,7 @@ impl OnDemandHttpsServer {
         extension_registry: Arc<Mutex<ExtensionRegistry>>,
         http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
         secure_file_server: SecureFileServer,
+        stats_collector: Arc<HourlyStatsCollector>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("🔍 Starting HTTPS connection handling");
 
@@ -1405,6 +1423,7 @@ impl OnDemandHttpsServer {
                 extension_registry,
                 http_challenges,
                 secure_file_server,
+                stats_collector,
         ).await
     }
 
@@ -1416,6 +1435,7 @@ impl OnDemandHttpsServer {
         extension_registry: Arc<Mutex<ExtensionRegistry>>,
         http_challenges: Arc<Mutex<BTreeMap<String, String>>>,
         secure_file_server: SecureFileServer,
+        stats_collector: Arc<HourlyStatsCollector>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("🔍 Starting async HTTPS connection handling");
 
@@ -1447,6 +1467,7 @@ impl OnDemandHttpsServer {
                 &extension_registry,
                 &http_challenges,
                 &secure_file_server,
+                &stats_collector,
             ).await?;
 
             // Determine if we should keep the connection alive
@@ -1482,6 +1503,7 @@ impl OnDemandHttpsServer {
         extension_registry: &Arc<Mutex<ExtensionRegistry>>,
         http_challenges: &Arc<Mutex<BTreeMap<String, String>>>,
         secure_file_server: &SecureFileServer,
+        stats_collector: &Arc<HourlyStatsCollector>,
     ) -> Result<(HttpVersion, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1510,6 +1532,9 @@ impl OnDemandHttpsServer {
         let method = parts[0];
         let path = parts[1];
         let http_version_str = parts[2];
+
+        // Record request for stats collection
+        stats_collector.record_request();
 
         // Parse HTTP version
         let http_version = HttpVersion::from_request_line(first_line);
@@ -1783,6 +1808,7 @@ impl OnDemandHttpsServer {
 
     /// Handle HTTPS connection in blocking context (for rustls compatibility)
     fn handle_https_connection_blocking(
+        &self,
         mut stream: std::net::TcpStream,
         cert_resolver: Arc<dyn ResolvesServerCert + Send + Sync>,
         args: Args,
@@ -1877,7 +1903,7 @@ impl OnDemandHttpsServer {
             println!("🔍 Processing HTTPS request {} for domain: {}", request_count, server_name);
 
             // Process the request and get parsed version/connection info
-            let (http_version, connection_header) = Self::process_https_request_static_blocking(&mut stream, &mut conn, &server_name, &extension_registry, &http_challenges, &secure_file_server)?;
+            let (http_version, connection_header) = self.process_https_request_static_blocking(&mut stream, &mut conn, &server_name, &extension_registry, &http_challenges, &secure_file_server)?;
 
             // Determine if we should keep the connection alive
             let should_keep_alive = connection_policy.should_keep_alive(
@@ -1990,6 +2016,7 @@ impl OnDemandHttpsServer {
 
     /// Process HTTPS request and send response (blocking version for rustls)
     fn process_https_request_static_blocking(
+        &self,
         stream: &mut std::net::TcpStream,
         conn: &mut ServerConnection,
         server_name: &str,
@@ -2117,6 +2144,9 @@ impl OnDemandHttpsServer {
         } else {
             "/"
         };
+
+        // Record request for stats collection
+        self.stats_collector.record_request();
 
         println!("Requested path: {}", request_path);
 
@@ -3327,8 +3357,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Simple console logger without regex dependency
     log::set_logger(&SimpleLogger).unwrap();
 
+    // Initialize file logging
+    let log_file_path = "/var/log/easyp/server.log";
+    if let Err(e) = init_file_logger(log_file_path) {
+        eprintln!("Warning: Failed to initialize file logger: {}", e);
+        // Fallback to /tmp if /var/log is not accessible
+        let fallback_path = "/tmp/easyp.log";
+        if let Err(e2) = init_file_logger(fallback_path) {
+            eprintln!("Warning: Failed to initialize fallback file logger: {}", e2);
+        } else {
+            println!("📝 File logging initialized: {}", fallback_path);
+        }
+    } else {
+        println!("📝 File logging initialized: {}", log_file_path);
+    }
+
+    // Initialize hourly stats collector
+    let stats_file = "/var/lib/easyp/stats/hourly_stats.json".to_string();
+    let stats_collector = Arc::new(HourlyStatsCollector::new(stats_file));
+
+    // Start background stats collection task
+    let stats_collector_clone = stats_collector.clone();
+    tokio::spawn(async move {
+        start_stats_collection_task(stats_collector_clone).await;
+    });
+
     // Create and run server
-    let server = OnDemandHttpsServer::new(args).await?;
+    let server = OnDemandHttpsServer::new(args, stats_collector).await?;
     server.run().await?;
 
     Ok(())
