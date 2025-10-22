@@ -30,6 +30,11 @@ mod file_logger;
 use file_logger::{init_file_logger, write_file_log, get_log_file_path};
 use std::time::Duration;
 
+// Import enhanced error reporting
+#[path = "../modules/enhanced_error.rs"]
+mod enhanced_error;
+use enhanced_error::{file_ops, network_ops, EnhancedError};
+
 use lexopt::prelude::*;
 use rustls::server::{Acceptor, ResolvesServerCert};
 use rustls::{ServerConfig, ServerConnection};
@@ -162,7 +167,14 @@ impl Args {
         let mut test_root = "test_root".to_string();
         let mut root = "/var/www/html".to_string();
         let mut allowed_ips = None;
-        let mut cache_dir = "/var/lib/easyp/certs".to_string();
+        // Use user-appropriate cache directory based on whether running as root
+        let mut cache_dir = if is_running_as_root() {
+            "/var/lib/easyp/certs".to_string()
+        } else {
+            // For non-root users, use home directory
+            let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            format!("{}/.local/share/easyp/certs", home_dir)
+        };
         let mut verbose = false;
         let mut test_mode = false;
         let mut restore_backup = false;
@@ -257,7 +269,7 @@ impl Args {
                     println!("        --test-root <ROOT>                Test root directory for integration tests [default: test_root]");
                     println!("        --root <ROOT>                     Document root directory [default: /var/www/html]");
                     println!("        --allowed-ips <IPS>               Allowed IP addresses for on-demand certificate requests (comma-separated)");
-                    println!("        --cache-dir <DIR>                 Cache directory for ACME certificates [default: /var/lib/easyp/certs]");
+                    println!("        --cache-dir <DIR>                 Cache directory for ACME certificates [default: /var/lib/easyp/certs for root, ~/.local/share/easyp/certs for users]");
                     println!("    -v, --verbose                        Enable verbose logging");
                     println!("        --test-mode                       Test mode (use self-signed certificates)");
                     println!("        --restore-backup                  Restore ACME certificates from backup before starting");
@@ -267,6 +279,14 @@ impl Args {
                     println!("        --challenge-type <TYPE>           Challenge type (http01 or dns01) [default: http01]");
                     println!("        --admin-urls                      Print admin URLs for all domains and admin keys, then exit");
                     println!("        --help                            Print help information");
+                    println!();
+                    println!("Non-root usage:");
+                    println!("    When running as a non-root user, easyp automatically enables --over-9000:");
+                    println!("    - HTTP: 9080 (instead of 80)");
+                    println!("    - HTTPS: 9443 (instead of 443)");
+                    println!("    - No permission errors or manual configuration needed");
+                    println!("    - ACME certificate generation may not work properly without root privileges");
+                    println!("    - Consider running with sudo for production use");
                     std::process::exit(0);
                 }
                 _ => return Err(format!("unexpected argument: {:?}", arg).into()),
@@ -275,6 +295,14 @@ impl Args {
 
         // Domains are optional for on-demand HTTPS server
         // The server can discover domains dynamically from certificate requests
+
+        // Auto-enable --over-9000 for non-root users to avoid permission issues
+        #[cfg(unix)]
+        if !is_running_as_root() && !over_9000 {
+            println!("ℹ️  Running as non-root user. Automatically enabling --over-9000 to avoid permission issues.");
+            println!("ℹ️  Server will use ports 9080 (HTTP) and 9443 (HTTPS) instead of privileged ports.");
+            over_9000 = true;
+        }
 
         Ok(Args {
             domains,
@@ -314,13 +342,20 @@ impl TestCertResolver {
     fn new(allowed_ips: Vec<IpAddr>) -> Result<Self, Box<dyn std::error::Error>> {
         println!("🔍 Initializing TestCertResolver with self-signed certificate...");
 
-        // Try to load existing self-signed certificate
-        let cert_path = "/var/lib/easyp/certs/localhost/fullchain.pem";
-        let key_path = "/var/lib/easyp/certs/localhost/privkey.pem";
+        // Try to load existing self-signed certificate using user-appropriate paths
+        let (cert_path, key_path) = if is_running_as_root() {
+            ("/var/lib/easyp/certs/localhost/fullchain.pem".to_string(),
+             "/var/lib/easyp/certs/localhost/privkey.pem".to_string())
+        } else {
+            // For non-root users, use home directory
+            let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            (format!("{}/.local/share/easyp/certs/localhost/fullchain.pem", home_dir),
+             format!("{}/.local/share/easyp/certs/localhost/privkey.pem", home_dir))
+        };
 
-        let default_cert = if std::path::Path::new(cert_path).exists() && std::path::Path::new(key_path).exists() {
+        let default_cert = if std::path::Path::new(&cert_path).exists() && std::path::Path::new(&key_path).exists() {
             println!("🔍 Loading existing self-signed certificate from {}", cert_path);
-            match Self::load_certificate_from_files(cert_path, key_path) {
+            match Self::load_certificate_from_files(&cert_path, &key_path) {
                 Ok(cert) => {
                     println!("✅ Successfully loaded existing self-signed certificate");
                     Some(cert)
@@ -395,15 +430,22 @@ impl TestCertResolver {
     }
 
     fn generate_self_signed_certificate(domain: &str) -> Result<CertifiedKey, Box<dyn std::error::Error>> {
-        use rcgen::{CertificateParams, KeyPair, SanType, PKCS_RSA_SHA256};
+        use rcgen::{CertificateParams, KeyPair, SanType};
 
-        // Create certificate directory
-        let cert_dir = format!("/var/lib/easyp/certs/{}", domain);
-        std::fs::create_dir_all(&cert_dir)?;
+        // Create certificate directory using user-appropriate paths
+        let cert_dir = if is_running_as_root() {
+            format!("/var/lib/easyp/certs/{}", domain)
+        } else {
+            // For non-root users, use home directory
+            let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            format!("{}/.local/share/easyp/certs/{}", home_dir, domain)
+        };
+        println!("DEBUG: Attempting to create certificate directory: {}", cert_dir);
+        file_ops::create_dir_all(&cert_dir)?;
+        println!("DEBUG: Certificate directory created successfully");
 
-        // Generate RSA key pair for better Safari 6-8 compatibility
-        // Safari 6-8 has better support for RSA certificates than ECDSA
-        let key_pair = KeyPair::generate_for(&PKCS_RSA_SHA256)?;
+        // Generate ECDSA key pair (more commonly supported)
+        let key_pair = KeyPair::generate()?;
 
         // Create certificate parameters
         let mut params = CertificateParams::new(vec![domain.to_string()])?;
@@ -442,22 +484,22 @@ impl TestCertResolver {
         let key_pem = key_pair.serialize_pem();
 
         // Write fullchain.pem (same as cert.pem for self-signed)
-        std::fs::write(format!("{}/fullchain.pem", cert_dir), &cert_pem)?;
+        file_ops::write(format!("{}/fullchain.pem", cert_dir), &cert_pem)?;
 
         // Write privkey.pem
-        std::fs::write(format!("{}/privkey.pem", cert_dir), &key_pem)?;
+        file_ops::write(format!("{}/privkey.pem", cert_dir), &key_pem)?;
 
         // Set proper permissions
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&cert_dir)?.permissions();
+            let mut perms = file_ops::metadata(&cert_dir)?.permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(&cert_dir, perms)?;
+            file_ops::set_permissions(&cert_dir, perms)?;
 
-            let mut key_perms = std::fs::metadata(format!("{}/privkey.pem", cert_dir))?.permissions();
+            let mut key_perms = file_ops::metadata(format!("{}/privkey.pem", cert_dir))?.permissions();
             key_perms.set_mode(0o600);
-            std::fs::set_permissions(format!("{}/privkey.pem", cert_dir), key_perms)?;
+            file_ops::set_permissions(format!("{}/privkey.pem", cert_dir), key_perms)?;
         }
 
         println!("✅ Self-signed certificate generated for {} in {}", domain, cert_dir);
@@ -529,14 +571,20 @@ struct OnDemandHttpsServer {
     extension_registry: Arc<Mutex<ExtensionRegistry>>, // Extension system
     secure_file_server: SecureFileServer, // Secure file serving with security features
     stats_collector: Arc<HourlyStatsCollector>, // Hourly statistics collection
+    port_80_available: bool, // Whether port 80 is available for ACME challenges
 }
 
 impl OnDemandHttpsServer {
     /// Create a new on-demand HTTPS server
     async fn new(args: Args, stats_collector: Arc<HourlyStatsCollector>) -> Result<Self, Box<dyn std::error::Error>> {
-        // Apply --over-9000 option to port numbers
-        let http_port = if args.over_9000 {
-            args.http_port + 9000
+        // Check if port 80 is available for ACME challenges
+        let port_80_available = is_port_80_available().await;
+
+        // Apply --over-9000 option to port numbers, but only if port 80 is not available
+        let http_port = if port_80_available {
+            args.http_port  // Use port 80 for ACME challenges
+        } else if args.over_9000 {
+            args.http_port + 9000  // Use port 9080 when port 80 not available
         } else {
             args.http_port
         };
@@ -548,17 +596,24 @@ impl OnDemandHttpsServer {
         };
 
         // Use legacy --port argument if provided (overrides --https-port)
-        let final_https_port = if args.port != 443 || args.over_9000 {
+        // But if --over-9000 is enabled, use the calculated https_port instead
+        let final_https_port = if args.over_9000 {
+            https_port
+        } else if args.port != 443 {
             args.port
         } else {
             https_port
         };
 
         // Create HTTP listener on specified port for ACME challenges
-        let http_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", http_port)).await?;
+        println!("DEBUG: Attempting to bind HTTP listener to 0.0.0.0:{}", http_port);
+        let http_listener = network_ops::bind_tcp_listener(&format!("0.0.0.0:{}", http_port)).await?;
+        println!("DEBUG: HTTP listener bound successfully");
 
         // Create HTTPS listener on specified port for HTTPS traffic
-        let https_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", final_https_port)).await?;
+        println!("DEBUG: Attempting to bind HTTPS listener to 0.0.0.0:{}", final_https_port);
+        let https_listener = network_ops::bind_tcp_listener(&format!("0.0.0.0:{}", final_https_port)).await?;
+        println!("DEBUG: HTTPS listener bound successfully");
 
         // Look up www-data UID/GID dynamically (only on UNIX systems and when running as root)
         #[cfg(unix)]
@@ -644,103 +699,183 @@ impl OnDemandHttpsServer {
                    detected_ips
                };
 
-               // Create certificate resolver with real ACME integration
-               #[cfg(feature = "acme")]
-               let (cert_resolver, acme_client) = if args.test_mode {
-                   // In test mode, use staging ACME servers for real certificates
-                   let directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory".to_string();
-
-                   // Determine email (prefer new --email over legacy --acme-email)
-                   let email = args.email.clone()
-                       .or(args.acme_email.clone())
-                       .unwrap_or_default();
-
-                   // Determine cache directory (use staging subdirectory for test mode)
-                   let cache_dir = Some(format!("{}/staging", args.cache_dir));
-
-                   let acme_config = AcmeConfig {
-                       directory_url,
-                       email,
-                       allowed_ips: allowed_ips.clone(),
-                       cache_dir,
-                       renewal_threshold_days: 30,
-                       challenge_type: ChallengeType::Http01("".to_string(), "".to_string()),
-                       is_staging: true, // Always staging in test mode
-                       bogus_domain: args.bogus_domain.clone(),
-                   };
-
-                   let acme_client = AcmeClient::new(acme_config);
-                   let acme_client = Arc::new(acme_client);
-                   let dns_validator = Arc::new(DnsValidator::new(allowed_ips.clone())?);
-
-                   let cert_resolver = Arc::new(OnDemandCertResolver::new(
-                       acme_client.clone(),
-                       dns_validator,
-                       None, // No fallback resolver
-                       1000, // Max cache size
-                       Duration::from_secs(30 * 24 * 60 * 60), // 30 days renewal threshold
-                   )?);
-
-                   (cert_resolver as Arc<dyn ResolvesServerCert + Send + Sync>, Some(acme_client))
-               } else {
-                   // Determine ACME directory URL
-                   let directory_url = if args.staging {
-                       "https://acme-staging-v02.api.letsencrypt.org/directory".to_string()
-                   } else {
-                       args.acme_directory.clone()
-                   };
-
-                   // Determine email (prefer new --email over legacy --acme-email)
-                   // If no email is provided, the ACME client will generate webmaster@domain for each domain
-                   let email = args.email.clone()
-                       .or(args.acme_email.clone())
-                       .unwrap_or_default();
-
-                   // Determine cache directory (use staging or production subdirectory based on staging flag)
-                   let cache_dir = if args.staging || args.acme_directory.contains("staging") || args.acme_directory.contains("stg") {
-                       Some(format!("{}/staging", args.cache_dir))
-                   } else {
-                       Some(format!("{}/production", args.cache_dir))
-                   };
-
-                   let acme_config = AcmeConfig {
-                       directory_url,
-                       email,
-                       allowed_ips: allowed_ips.clone(),
-                       cache_dir: cache_dir.clone(),
-                       renewal_threshold_days: 30,
-                       challenge_type: ChallengeType::Http01("".to_string(), "".to_string()),
-                       is_staging: args.staging || args.acme_directory.contains("staging") || args.acme_directory.contains("stg"),
-                       bogus_domain: args.bogus_domain.clone(),
-                   };
-
-                   let acme_client = AcmeClient::new(acme_config);
-
-                   // Restore from backup if requested
-                   if args.restore_backup {
-                       println!("🔄 Restoring ACME certificates from backup...");
-                       let acme_persist_dir = format!("{}/acme_lib", cache_dir.as_ref().unwrap());
-                       if let Err(e) = acme_client.restore_acme_data(&acme_persist_dir) {
-                           println!("⚠️  Failed to restore from backup: {}", e);
-                       } else {
-                           println!("✅ ACME certificates restored from backup");
-                       }
+               // Only perform privilege operations if running as root
+               if is_running_as_root() {
+                   // Ensure certificate cache directory has proper ownership before dropping privileges
+                   #[cfg(unix)]
+                   if let Err(e) = ensure_cert_cache_permissions(&args.cache_dir, www_data_uid, www_data_gid) {
+                       println!("Warning: Failed to set certificate cache permissions: {}", e);
+                       // Continue anyway - this is not a fatal error
                    }
 
-                   // Note: ACME account will be initialized per-domain when certificates are requested
+                   // Ensure /tmp/acme_certs directory exists and is owned by www-data (acme-lib requirement)
+                   #[cfg(unix)]
+                   if let Err(e) = ensure_tmp_acme_permissions(www_data_uid, www_data_gid) {
+                       println!("Warning: Failed to set /tmp/acme_certs permissions: {}", e);
+                       // Continue anyway - this is not a fatal error
+                   }
 
-                   let acme_client = Arc::new(acme_client);
-                   let dns_validator = Arc::new(DnsValidator::new(allowed_ips.clone())?);
+                   // Ensure ACME cache directory is properly configured and accessible
+                   println!("ACME cache directory: {}", args.cache_dir);
+                   #[cfg(unix)]
+                   if let Err(e) = ensure_acme_cache_directory(&args.cache_dir, www_data_uid, www_data_gid) {
+                       println!("Error: Failed to set up ACME cache directory: {}", e);
+                       return Err(format!("ACME cache directory setup failed: {}", e).into());
+                   }
+               } else {
+                   // For non-root users, just create the directory without privilege operations
+                   println!("ACME cache directory: {}", args.cache_dir);
+                   if let Err(e) = file_ops::create_dir_all(&args.cache_dir) {
+                       println!("Error: Failed to create ACME cache directory: {}", e);
+                       return Err(format!("ACME cache directory creation failed: {}", e).into());
+                   }
 
-                   let cert_resolver = Arc::new(OnDemandCertResolver::new(
-                       acme_client.clone(),
-                       dns_validator,
-                       None, // No fallback resolver
-                       1000, // Max cache size
-                       Duration::from_secs(30 * 24 * 60 * 60), // 30 days renewal threshold
-                   )?);
+                   // Create the acme_lib subdirectory
+                   let acme_lib_dir = format!("{}/acme_lib", args.cache_dir);
+                   if let Err(e) = file_ops::create_dir_all(&acme_lib_dir) {
+                       println!("Error: Failed to create ACME lib directory: {}", e);
+                       return Err(format!("ACME lib directory creation failed: {}", e).into());
+                   }
 
-                   (cert_resolver as Arc<dyn ResolvesServerCert + Send + Sync>, Some(acme_client))
+                   println!("ACME cache directory created: {}", args.cache_dir);
+                   println!("ACME lib directory created: {}", acme_lib_dir);
+               }
+
+               // Check if port 80 is available for ACME challenges
+               let port_80_available = is_port_80_available().await;
+
+               if !port_80_available {
+                   println!("⚠️  Port 80 is not available. ACME certificate generation will not be possible.");
+                   println!("ℹ️  Using self-signed certificates instead. Run as root or ensure port 80 is available for real certificates.");
+               }
+
+               // Create certificate resolver with real ACME integration
+               #[cfg(feature = "acme")]
+               let (cert_resolver, acme_client) = if args.test_mode || !port_80_available {
+                   if !port_80_available {
+                       // Port 80 not available, use self-signed certificates
+                       println!("🔒 Using self-signed certificates (port 80 not available for ACME challenges)");
+                       (Arc::new(TestCertResolver::new(allowed_ips.clone())?) as Arc<dyn ResolvesServerCert + Send + Sync>, None)
+                   } else {
+                       // In test mode with port 80 available, use staging ACME servers for real certificates
+                       let directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory".to_string();
+
+                       // Determine email (prefer new --email over legacy --acme-email)
+                       let email = args.email.clone()
+                           .or(args.acme_email.clone())
+                           .unwrap_or_default();
+
+                       // Determine cache directory (use staging subdirectory for test mode)
+                       let cache_dir = Some(format!("{}/staging", args.cache_dir));
+
+                       let acme_config = AcmeConfig {
+                           directory_url,
+                           email,
+                           allowed_ips: allowed_ips.clone(),
+                           cache_dir,
+                           renewal_threshold_days: 30,
+                           challenge_type: ChallengeType::Http01("".to_string(), "".to_string()),
+                           is_staging: true, // Always staging in test mode
+                           bogus_domain: args.bogus_domain.clone(),
+                       };
+
+                       let acme_client = AcmeClient::new(acme_config);
+                       let acme_client = Arc::new(acme_client);
+
+                       // Warn about ACME limitations for non-root users
+                       #[cfg(unix)]
+                       if !is_running_as_root() {
+                           println!("⚠️  Running as non-root user. ACME certificate generation may not work properly.");
+                           println!("ℹ️  ACME challenges require binding to port 80, which needs root privileges.");
+                           println!("ℹ️  Consider running with sudo for production use or use --over-9000 for development.");
+                       }
+
+                       let dns_validator = Arc::new(DnsValidator::new(allowed_ips.clone())?);
+
+                       let cert_resolver = Arc::new(OnDemandCertResolver::new(
+                           acme_client.clone(),
+                           dns_validator,
+                           None, // No fallback resolver
+                           1000, // Max cache size
+                           Duration::from_secs(30 * 24 * 60 * 60), // 30 days renewal threshold
+                       )?);
+
+                       (cert_resolver as Arc<dyn ResolvesServerCert + Send + Sync>, Some(acme_client))
+                   }
+               } else {
+                   if !port_80_available {
+                       // Port 80 not available, use self-signed certificates even in production mode
+                       println!("🔒 Using self-signed certificates (port 80 not available for ACME challenges)");
+                       (Arc::new(TestCertResolver::new(allowed_ips.clone())?) as Arc<dyn ResolvesServerCert + Send + Sync>, None)
+                   } else {
+                       // Port 80 available, use real ACME certificates
+                       // Determine ACME directory URL
+                       let directory_url = if args.staging {
+                           "https://acme-staging-v02.api.letsencrypt.org/directory".to_string()
+                       } else {
+                           args.acme_directory.clone()
+                       };
+
+                       // Determine email (prefer new --email over legacy --acme-email)
+                       // If no email is provided, the ACME client will generate webmaster@domain for each domain
+                       let email = args.email.clone()
+                           .or(args.acme_email.clone())
+                           .unwrap_or_default();
+
+                       // Determine cache directory (use staging or production subdirectory based on staging flag)
+                       let cache_dir = if args.staging || args.acme_directory.contains("staging") || args.acme_directory.contains("stg") {
+                           Some(format!("{}/staging", args.cache_dir))
+                       } else {
+                           Some(format!("{}/production", args.cache_dir))
+                       };
+
+                       let acme_config = AcmeConfig {
+                           directory_url,
+                           email,
+                           allowed_ips: allowed_ips.clone(),
+                           cache_dir: cache_dir.clone(),
+                           renewal_threshold_days: 30,
+                           challenge_type: ChallengeType::Http01("".to_string(), "".to_string()),
+                           is_staging: args.staging || args.acme_directory.contains("staging") || args.acme_directory.contains("stg"),
+                           bogus_domain: args.bogus_domain.clone(),
+                       };
+
+                       let acme_client = AcmeClient::new(acme_config);
+
+                       // Warn about ACME limitations for non-root users
+                       #[cfg(unix)]
+                       if !is_running_as_root() {
+                           println!("⚠️  Running as non-root user. ACME certificate generation may not work properly.");
+                           println!("ℹ️  ACME challenges require binding to port 80, which needs root privileges.");
+                           println!("ℹ️  Consider running with sudo for production use or use --over-9000 for development.");
+                       }
+
+                       // Restore from backup if requested
+                       if args.restore_backup {
+                           println!("🔄 Restoring ACME certificates from backup...");
+                           let acme_persist_dir = format!("{}/acme_lib", cache_dir.as_ref().unwrap());
+                           if let Err(e) = acme_client.restore_acme_data(&acme_persist_dir) {
+                               println!("⚠️  Failed to restore from backup: {}", e);
+                           } else {
+                               println!("✅ ACME certificates restored from backup");
+                           }
+                       }
+
+                       // Note: ACME account will be initialized per-domain when certificates are requested
+
+                       let acme_client = Arc::new(acme_client);
+                       let dns_validator = Arc::new(DnsValidator::new(allowed_ips.clone())?);
+
+                       let cert_resolver = Arc::new(OnDemandCertResolver::new(
+                           acme_client.clone(),
+                           dns_validator,
+                           None, // No fallback resolver
+                           1000, // Max cache size
+                           Duration::from_secs(30 * 24 * 60 * 60), // 30 days renewal threshold
+                       )?);
+
+                       (cert_resolver as Arc<dyn ResolvesServerCert + Send + Sync>, Some(acme_client))
+                   }
                };
 
                #[cfg(not(feature = "acme"))]
@@ -748,28 +883,6 @@ impl OnDemandHttpsServer {
                    // Fallback to test resolver if ACME feature not enabled
                    (Arc::new(TestCertResolver::new(allowed_ips)?), None)
                };
-
-               // Ensure certificate cache directory has proper ownership before dropping privileges
-               #[cfg(unix)]
-               if let Err(e) = ensure_cert_cache_permissions(&args.cache_dir, www_data_uid, www_data_gid) {
-                   println!("Warning: Failed to set certificate cache permissions: {}", e);
-                   // Continue anyway - this is not a fatal error
-               }
-
-               // Ensure /tmp/acme_certs directory exists and is owned by www-data (acme-lib requirement)
-               #[cfg(unix)]
-               if let Err(e) = ensure_tmp_acme_permissions(www_data_uid, www_data_gid) {
-                   println!("Warning: Failed to set /tmp/acme_certs permissions: {}", e);
-                   // Continue anyway - this is not a fatal error
-               }
-
-               // Ensure ACME cache directory is properly configured and accessible
-               println!("ACME cache directory: {}", args.cache_dir);
-               #[cfg(unix)]
-               if let Err(e) = ensure_acme_cache_directory(&args.cache_dir, www_data_uid, www_data_gid) {
-                   println!("Error: Failed to set up ACME cache directory: {}", e);
-                   return Err(format!("ACME cache directory setup failed: {}", e).into());
-               }
 
                // Domain request logger removed - was unused dead code
 
@@ -850,14 +963,18 @@ impl OnDemandHttpsServer {
                    extension_registry,
                    secure_file_server,
                    stats_collector,
+                   port_80_available,
                })
     }
 
     /// Run the server
     async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Calculate actual ports (including --over-9000 effect)
-        let http_port = if self.args.over_9000 {
-            self.args.http_port + 9000
+        // Note: This should match the logic in the constructor
+        let http_port = if self.port_80_available {
+            self.args.http_port  // Use port 80 for ACME challenges
+        } else if self.args.over_9000 {
+            self.args.http_port + 9000  // Use port 9080 when port 80 not available
         } else {
             self.args.http_port
         };
@@ -868,14 +985,24 @@ impl OnDemandHttpsServer {
             self.args.https_port
         };
 
-        let final_https_port = if self.args.port != 443 || self.args.over_9000 {
+        println!("DEBUG: Port calculation - over_9000: {}, args.port: {}, args.https_port: {}, https_port: {}",
+                 self.args.over_9000, self.args.port, self.args.https_port, https_port);
+
+        let final_https_port = if self.args.over_9000 {
+            https_port
+        } else if self.args.port != 443 {
             self.args.port
         } else {
             https_port
         };
 
+        println!("DEBUG: Final port calculation - final_https_port: {}", final_https_port);
         println!("Starting easyp on-demand HTTPS server");
-        println!("HTTP listener on port {} (for ACME challenges)", http_port);
+        if self.port_80_available {
+            println!("HTTP listener on port {} (for ACME challenges)", http_port);
+        } else {
+            println!("HTTP listener on port {} (for file serving only - no ACME challenges)", http_port);
+        }
         println!("HTTPS listener on port {} (for HTTPS traffic)", final_https_port);
         println!("Allowed IPs: {:?}", self.allowed_ips);
         println!("ACME Directory: {}", if self.args.staging { "https://acme-staging-v02.api.letsencrypt.org/directory" } else { &self.args.acme_directory });
@@ -2824,12 +2951,12 @@ fn ensure_acme_cache_directory(cache_dir: &str, uid: u32, gid: u32) -> Result<()
     use std::process::Command;
 
     // Create the main cache directory
-    std::fs::create_dir_all(cache_dir)?;
+    file_ops::create_dir_all(cache_dir)?;
 
     // Create the acme_lib subdirectory
     let acme_lib_dir = format!("{}/acme_lib", cache_dir);
     //TODO
-    std::fs::create_dir_all(&acme_lib_dir)?;
+    file_ops::create_dir_all(&acme_lib_dir)?;
 
     // Set ownership to www-data for both directories
     let output = Command::new("chown")
@@ -3007,6 +3134,22 @@ fn is_running_as_root() -> bool {
     false // On non-Unix systems, assume not root
 }
 
+/// Check if port 80 is available for ACME challenges
+async fn is_port_80_available() -> bool {
+    use tokio::net::TcpListener;
+
+    match TcpListener::bind("0.0.0.0:80").await {
+        Ok(_) => {
+            // Port 80 is available, close the listener
+            true
+        }
+        Err(_) => {
+            // Port 80 is not available (permission denied or already in use)
+            false
+        }
+    }
+}
+
 /// Look up the UID and GID for the www-data user
 #[cfg(unix)]
 fn get_www_data_uid_gid() -> Result<(u32, u32), Box<dyn std::error::Error>> {
@@ -3109,14 +3252,22 @@ fn parse_allowed_ips(ips_str: &str) -> Result<Vec<IpAddr>, Box<dyn std::error::E
 
 /// Get admin keys from the admin_keys file
 fn get_admin_keys() -> Result<std::collections::HashSet<String>, Box<dyn std::error::Error>> {
-    let admin_keys_file = std::path::Path::new("/var/lib/easyp/admin_keys");
+    // Use user-appropriate admin keys file path
+    let admin_keys_path = if is_running_as_root() {
+        "/var/lib/easyp/admin_keys".to_string()
+    } else {
+        // For non-root users, use home directory
+        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.local/share/easyp/admin_keys", home_dir)
+    };
+    let admin_keys_file = std::path::Path::new(&admin_keys_path);
     let mut admin_keys = std::collections::HashSet::new();
 
     println!("DEBUG: Checking admin keys file: {:?}", admin_keys_file);
     println!("DEBUG: File exists: {}", admin_keys_file.exists());
 
     if admin_keys_file.exists() {
-        if let Ok(content) = std::fs::read_to_string(admin_keys_file) {
+        if let Ok(content) = file_ops::read_to_string(admin_keys_file) {
             for line in content.lines() {
                 if !line.is_empty() {
                     admin_keys.insert(line.to_string());
@@ -3142,7 +3293,7 @@ fn get_domains(cache_dir: &str) -> Result<Vec<String>, Box<dyn std::error::Error
         for subdir in ["staging", "production"] {
             let subdir_path = cache_path.join(subdir);
             if subdir_path.exists() {
-                if let Ok(entries) = std::fs::read_dir(&subdir_path) {
+                if let Ok(entries) = file_ops::read_dir(&subdir_path) {
                     for entry in entries {
                         if let Ok(entry) = entry {
                             if let Some(file_name) = entry.file_name().to_str() {
@@ -3312,11 +3463,19 @@ fn generate_admin_key_for_extension(ext_name: &str) -> String {
 
 /// Save admin keys to file
 fn save_admin_keys(admin_keys: &std::collections::HashSet<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let admin_keys_file = std::path::Path::new("/var/lib/easyp/admin_keys");
+    // Use user-appropriate admin keys file path
+    let admin_keys_path = if is_running_as_root() {
+        "/var/lib/easyp/admin_keys".to_string()
+    } else {
+        // For non-root users, use home directory
+        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.local/share/easyp/admin_keys", home_dir)
+    };
+    let admin_keys_file = std::path::Path::new(&admin_keys_path);
 
     // Create parent directory if it doesn't exist
     if let Some(parent) = admin_keys_file.parent() {
-        std::fs::create_dir_all(parent)?;
+        file_ops::create_dir_all(parent)?;
     }
 
     let mut content = String::new();
@@ -3325,7 +3484,7 @@ fn save_admin_keys(admin_keys: &std::collections::HashSet<String>) -> Result<(),
         content.push_str(&format!("{}\n", k));
     }
 
-    std::fs::write(admin_keys_file, content)?;
+    file_ops::write(admin_keys_file, content)?;
     println!("Admin keys saved to file");
 
     Ok(())
@@ -3357,12 +3516,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Simple console logger without regex dependency
     log::set_logger(&SimpleLogger).unwrap();
 
-    // Initialize file logging
-    let log_file_path = "/var/log/easyp/server.log";
-    if let Err(e) = init_file_logger(log_file_path) {
+    // Initialize file logging with per-user directories
+    let log_file_path = if is_running_as_root() {
+        "/var/log/easyp/server.log".to_string()
+    } else {
+        // For non-root users, use home directory
+        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.local/share/easyp/server.log", home_dir)
+    };
+
+    println!("DEBUG: Attempting to initialize file logger at: {}", log_file_path);
+    if let Err(e) = init_file_logger(&log_file_path) {
         eprintln!("Warning: Failed to initialize file logger: {}", e);
-        // Fallback to /tmp if /var/log is not accessible
+        // Fallback to /tmp if user directory is not accessible
         let fallback_path = "/tmp/easyp.log";
+        println!("DEBUG: Attempting fallback file logger at: {}", fallback_path);
         if let Err(e2) = init_file_logger(fallback_path) {
             eprintln!("Warning: Failed to initialize fallback file logger: {}", e2);
         } else {
@@ -3372,9 +3540,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("📝 File logging initialized: {}", log_file_path);
     }
 
-    // Initialize hourly stats collector
-    let stats_file = "/var/lib/easyp/stats/hourly_stats.json".to_string();
+    // Initialize hourly stats collector with per-user directories
+    let stats_file = if is_running_as_root() {
+        "/var/lib/easyp/stats/hourly_stats.json".to_string()
+    } else {
+        // For non-root users, use home directory
+        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.local/share/easyp/stats/hourly_stats.json", home_dir)
+    };
+    println!("DEBUG: Attempting to initialize stats collector at: {}", stats_file);
     let stats_collector = Arc::new(HourlyStatsCollector::new(stats_file));
+    println!("DEBUG: Stats collector initialized successfully");
 
     // Start background stats collection task
     let stats_collector_clone = stats_collector.clone();
@@ -3383,7 +3559,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Create and run server
+    println!("DEBUG: Attempting to create OnDemandHttpsServer");
     let server = OnDemandHttpsServer::new(args, stats_collector).await?;
+    println!("DEBUG: OnDemandHttpsServer created successfully");
+    println!("DEBUG: Starting server run loop");
     server.run().await?;
 
     Ok(())

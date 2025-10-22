@@ -48,3 +48,4 @@ pub fn setup_stats_directories() -> Result<(), String> {
 
     Ok(())
 }
+

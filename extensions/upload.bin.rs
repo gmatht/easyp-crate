@@ -17,3 +17,4 @@ pub fn handle_upload_request(
     Ok(r#"{"error": "Upload functionality available via admin panel only"}"#.to_string())
 }
 
+

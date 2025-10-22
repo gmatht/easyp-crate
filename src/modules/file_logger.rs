@@ -4,7 +4,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// File logger that writes logs to a file
@@ -80,50 +80,34 @@ impl FileLogger {
 }
 
 /// Global file logger instance
-static mut FILE_LOGGER: Option<Arc<FileLogger>> = None;
-static INIT: std::sync::Once = std::sync::Once::new();
+static FILE_LOGGER: OnceLock<Arc<FileLogger>> = OnceLock::new();
 
 /// Initialize the global file logger
 pub fn init_file_logger(log_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        INIT.call_once(|| {
-            match FileLogger::new(log_path) {
-                Ok(logger) => {
-                    FILE_LOGGER = Some(Arc::new(logger));
-                }
-                Err(e) => {
-                    eprintln!("Failed to initialize file logger: {}", e);
-                }
-            }
-        });
-    }
+    FILE_LOGGER.set(Arc::new(FileLogger::new(log_path)?))
+        .map_err(|_| "File logger already initialized")?;
     Ok(())
 }
 
 /// Write a log entry to the file logger
 pub fn write_file_log(level: &str, message: &str) {
-    unsafe {
-        if let Some(ref logger) = FILE_LOGGER {
-            if let Err(e) = logger.write_log(level, message) {
-                eprintln!("Failed to write to file logger: {}", e);
-            }
+    if let Some(logger) = FILE_LOGGER.get() {
+        if let Err(e) = logger.write_log(level, message) {
+            eprintln!("Failed to write to file logger: {}", e);
         }
     }
 }
 
 /// Get the current log file path
 pub fn get_log_file_path() -> Option<String> {
-    unsafe {
-        FILE_LOGGER.as_ref().map(|logger| logger.log_path().to_string())
-    }
+    FILE_LOGGER.get().map(|logger| logger.log_path().to_string())
 }
 
 /// Rotate the log file
 pub fn rotate_log_file() -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        if let Some(ref logger) = FILE_LOGGER {
-            logger.rotate()?;
-        }
+    if let Some(logger) = FILE_LOGGER.get() {
+        logger.rotate()?;
     }
     Ok(())
 }
+

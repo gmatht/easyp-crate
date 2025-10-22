@@ -53,7 +53,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Certificate generation and parsing
-rcgen = { path = "../rcgen/rcgen", features = ["pem", "ring"], default-features = false }
+rcgen = { path = "../rcgen/rcgen", features = ["pem", "ring", "x509-parser"], default-features = false }
 #rcgen = { workspace = true }
 #rustls-pemfile = { workspace = true }
 rustls-pemfile = { version = "2.2" }
