@@ -362,6 +362,16 @@ fn main() -> std::io::Result<()> {
     out.push_str("            }\n");
     out.push_str("        }\n");
     out.push_str("    }\n");
+    out.push_str("}\n\n");
+
+    // Add function to get available admin extensions
+    out.push_str("/// Get list of available admin extensions (generated at build time)\n");
+    out.push_str("pub fn get_build_time_admin_extensions() -> Vec<&'static str> {\n");
+    out.push_str("    vec![\n");
+    for (ident, _filename) in &admin_entries {
+        out.push_str(&format!("        \"{}\",\n", ident));
+    }
+    out.push_str("    ]\n");
     out.push_str("}\n");
 
     fs::write(&dest_path, out)?;

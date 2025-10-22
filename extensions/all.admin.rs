@@ -61,6 +61,8 @@ fn generate_all_admin_panel(admin_keys: &std::collections::HashMap<String, Strin
             "comment" => "Comment Moderation",
             "stats" => "System Statistics",
             "upload" => "File Upload Manager",
+            "logs" => "Server Logs",
+            "about" => "About",
             _ => ext_name,
         };
 
@@ -68,6 +70,8 @@ fn generate_all_admin_panel(admin_keys: &std::collections::HashMap<String, Strin
             "comment" => "Manage and moderate user comments. Review, approve, or reject comments submitted through the comment system.",
             "stats" => "Monitor system performance, memory usage, CPU load, disk space, and other server statistics in real-time.",
             "upload" => "Upload, manage, and organize files. View uploaded files, delete unwanted files, and monitor storage usage.",
+            "logs" => "View and monitor server logs in real-time. Search, filter, and analyze log messages for debugging and monitoring.",
+            "about" => "View server information, version details, and system configuration. Learn about the Easyp server and its capabilities.",
             _ => &format!("Manage {} settings and data.", ext_name),
         };
 

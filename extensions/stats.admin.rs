@@ -1,8 +1,9 @@
 // stats.admin.rs - Admin panel for system statistics
-// Handles system stats interface including memory info and load average
+// Handles system stats interface including memory info, load average, and hourly stats
 
 use std::fs;
 use std::collections::HashMap;
+use serde::{Serialize, Deserialize};
 
 // System memory information structure
 #[derive(Debug)]
@@ -53,6 +54,15 @@ struct DiskUsage {
     available: u64,
     usage_percent: f64,
     mount_point: String,
+}
+
+// Hourly statistics structure (matches the one in hourly_stats.rs)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HourlyStats {
+    timestamp: u64,        // Unix timestamp of the hour
+    memory_used_mb: f64,   // Memory usage in MB
+    cpu_usage_percent: f64, // CPU usage percentage
+    request_count: u64,    // Number of requests in this hour
 }
 
 // Parse memory information (platform-specific)
@@ -565,6 +575,125 @@ fn generate_stats_panel(admin_key: &str) -> String {
     html.push_str("</div>\n");
     html.push_str("</div>\n");
 
+    // Hourly Statistics Charts
+    html.push_str("<div class=\"stats-grid\">\n");
+    html.push_str("<div class=\"stat-card\" style=\"grid-column: 1 / -1;\">\n");
+    html.push_str("<h3>&#x1F4C8; Hourly Statistics (Last 48 Hours)</h3>\n");
+
+    match load_hourly_stats() {
+        Ok(stats) => {
+            if stats.is_empty() {
+                html.push_str("<p>No hourly statistics available yet. Data will appear after the server has been running for at least one hour.</p>\n");
+            } else {
+                // Generate JavaScript for charts
+                html.push_str("<div style=\"display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; margin: 20px 0;\">\n");
+
+                // Memory Usage Chart
+                html.push_str("<div>\n");
+                html.push_str("<h4>Memory Usage (MB)</h4>\n");
+                html.push_str("<canvas id=\"memoryChart\" width=\"300\" height=\"200\"></canvas>\n");
+                html.push_str("</div>\n");
+
+                // CPU Usage Chart
+                html.push_str("<div>\n");
+                html.push_str("<h4>CPU Usage (%)</h4>\n");
+                html.push_str("<canvas id=\"cpuChart\" width=\"300\" height=\"200\"></canvas>\n");
+                html.push_str("</div>\n");
+
+                // Request Count Chart
+                html.push_str("<div>\n");
+                html.push_str("<h4>Request Count</h4>\n");
+                html.push_str("<canvas id=\"requestChart\" width=\"300\" height=\"200\"></canvas>\n");
+                html.push_str("</div>\n");
+
+                html.push_str("</div>\n");
+
+                // Generate JavaScript data
+                let labels: Vec<String> = stats.iter().map(|s| format_timestamp(s.timestamp)).collect();
+                let memory_data: Vec<f64> = stats.iter().map(|s| s.memory_used_mb).collect();
+                let cpu_data: Vec<f64> = stats.iter().map(|s| s.cpu_usage_percent).collect();
+                let request_data: Vec<u64> = stats.iter().map(|s| s.request_count).collect();
+
+                html.push_str("<script>\n");
+                html.push_str("const chartData = {\n");
+                html.push_str(&format!("  labels: {:?},\n", labels));
+                html.push_str(&format!("  memory: {:?},\n", memory_data));
+                html.push_str(&format!("  cpu: {:?},\n", cpu_data));
+                html.push_str(&format!("  requests: {:?}\n", request_data));
+                html.push_str("};\n");
+
+                // Simple chart drawing function
+                html.push_str("function drawChart(canvasId, data, label, color) {\n");
+                html.push_str("  const canvas = document.getElementById(canvasId);\n");
+                html.push_str("  const ctx = canvas.getContext('2d');\n");
+                html.push_str("  const width = canvas.width;\n");
+                html.push_str("  const height = canvas.height;\n");
+                html.push_str("  \n");
+                html.push_str("  ctx.clearRect(0, 0, width, height);\n");
+                html.push_str("  \n");
+                html.push_str("  if (data.length === 0) return;\n");
+                html.push_str("  \n");
+                html.push_str("  const max = Math.max(...data);\n");
+                html.push_str("  const min = Math.min(...data);\n");
+                html.push_str("  const range = max - min || 1;\n");
+                html.push_str("  \n");
+                html.push_str("  ctx.strokeStyle = color;\n");
+                html.push_str("  ctx.lineWidth = 2;\n");
+                html.push_str("  ctx.beginPath();\n");
+                html.push_str("  \n");
+                html.push_str("  data.forEach((value, index) => {\n");
+                html.push_str("    const x = (index / (data.length - 1)) * (width - 40) + 20;\n");
+                html.push_str("    const y = height - 20 - ((value - min) / range) * (height - 40);\n");
+                html.push_str("    \n");
+                html.push_str("    if (index === 0) {\n");
+                html.push_str("      ctx.moveTo(x, y);\n");
+                html.push_str("    } else {\n");
+                html.push_str("      ctx.lineTo(x, y);\n");
+                html.push_str("    }\n");
+                html.push_str("  });\n");
+                html.push_str("  \n");
+                html.push_str("  ctx.stroke();\n");
+                html.push_str("  \n");
+                html.push_str("  // Draw data points\n");
+                html.push_str("  ctx.fillStyle = color;\n");
+                html.push_str("  data.forEach((value, index) => {\n");
+                html.push_str("    const x = (index / (data.length - 1)) * (width - 40) + 20;\n");
+                html.push_str("    const y = height - 20 - ((value - min) / range) * (height - 40);\n");
+                html.push_str("    ctx.beginPath();\n");
+                html.push_str("    ctx.arc(x, y, 3, 0, 2 * Math.PI);\n");
+                html.push_str("    ctx.fill();\n");
+                html.push_str("  });\n");
+                html.push_str("}\n");
+                html.push_str("\n");
+                html.push_str("// Draw all charts\n");
+                html.push_str("drawChart('memoryChart', chartData.memory, 'Memory (MB)', '#007bff');\n");
+                html.push_str("drawChart('cpuChart', chartData.cpu, 'CPU (%)', '#28a745');\n");
+                html.push_str("drawChart('requestChart', chartData.requests, 'Requests', '#dc3545');\n");
+                html.push_str("</script>\n");
+
+                // Summary statistics
+                if let (Some(last_memory), Some(last_cpu), Some(last_requests)) = (
+                    memory_data.last(),
+                    cpu_data.last(),
+                    request_data.last()
+                ) {
+                    html.push_str("<div style=\"margin-top: 20px; padding: 15px; background-color: #f8f9fa; border-radius: 8px;\">\n");
+                    html.push_str("<h4>Latest Hour Summary</h4>\n");
+                    html.push_str(&format!("<p><strong>Memory Usage:</strong> {:.1} MB</p>\n", last_memory));
+                    html.push_str(&format!("<p><strong>CPU Usage:</strong> {:.1}%</p>\n", last_cpu));
+                    html.push_str(&format!("<p><strong>Requests:</strong> {}</p>\n", last_requests));
+                    html.push_str("</div>\n");
+                }
+            }
+        }
+        Err(e) => {
+            html.push_str(&format!("<div class=\"error\">Error loading hourly stats: {}</div>\n", html_escape(&e)));
+        }
+    }
+
+    html.push_str("</div>\n");
+    html.push_str("</div>\n");
+
     html.push_str("<div class=\"refresh-info\">\n");
     html.push_str("<p>This page refreshes automatically every 30 seconds</p>\n");
     html.push_str(&format!("<p>Last updated: {}</p>\n", get_current_time()));
@@ -591,6 +720,38 @@ fn get_current_time() -> String {
     let seconds = total_seconds % 60;
 
     format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+}
+
+// Load hourly statistics from file
+fn load_hourly_stats() -> Result<Vec<HourlyStats>, String> {
+    let stats_file = "/var/lib/easyp/stats/hourly_stats.json";
+
+    if !std::path::Path::new(stats_file).exists() {
+        return Ok(Vec::new()); // No data yet
+    }
+
+    let json = fs::read_to_string(stats_file)
+        .map_err(|e| format!("Failed to read stats file: {}", e))?;
+
+    let stats: Vec<HourlyStats> = serde_json::from_str(&json)
+        .map_err(|e| format!("Failed to parse stats JSON: {}", e))?;
+
+    Ok(stats)
+}
+
+// Format timestamp for display
+fn format_timestamp(timestamp: u64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH, Duration};
+
+    let datetime = UNIX_EPOCH + Duration::from_secs(timestamp);
+    let datetime = SystemTime::from(datetime);
+
+    // Simple formatting - you could use a proper date library for better formatting
+    let total_seconds = timestamp;
+    let hours = (total_seconds / 3600) % 24;
+    let days = total_seconds / 86400;
+
+    format!("Day {} {:02}:00", days, hours)
 }
 
 // HTML escape function
