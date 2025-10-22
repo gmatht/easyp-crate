@@ -22,7 +22,7 @@ pub struct HourlyStats {
 pub struct HourlyStatsCollector {
     stats: Arc<Mutex<VecDeque<HourlyStats>>>,
     current_hour_requests: Arc<Mutex<u64>>,
-    data_file: String,
+    pub data_file: String,
 }
 
 impl HourlyStatsCollector {
@@ -282,43 +282,77 @@ impl HourlyStatsCollector {
         Ok(usage)
     }
 
-    /// Save statistics to disk
+    /// Save statistics to disk in JSONL format for easier appending
     fn save_stats(&self) -> Result<(), String> {
         let stats = self.stats.lock()
             .map_err(|e| format!("Failed to lock stats: {}", e))?;
 
-        let stats_vec: Vec<HourlyStats> = stats.iter().cloned().collect();
-        let json = serde_json::to_string_pretty(&stats_vec)
-            .map_err(|e| format!("Failed to serialize stats: {}", e))?;
-
-        // Ensure directory exists
-        if let Some(parent) = Path::new(&self.data_file).parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create stats directory: {}", e))?;
+        // Convert to JSONL format (one JSON object per line)
+        let mut jsonl = String::new();
+        for stat in stats.iter() {
+            let json_line = serde_json::to_string(stat)
+                .map_err(|e| format!("Failed to serialize stat entry: {}", e))?;
+            jsonl.push_str(&json_line);
+            jsonl.push('\n');
         }
 
-        fs::write(&self.data_file, json)
-            .map_err(|e| format!("Failed to write stats file: {}", e))?;
+        // Ensure directory exists with better error handling
+        if let Some(parent) = Path::new(&self.data_file).parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| {
+                    format!("Failed to create stats directory '{}': {} (os error {})",
+                           parent.display(), e, e.raw_os_error().unwrap_or(0))
+                })?;
+        }
+
+        fs::write(&self.data_file, jsonl)
+            .map_err(|e| {
+                format!("Failed to write stats file '{}': {} (os error {})",
+                       self.data_file, e, e.raw_os_error().unwrap_or(0))
+            })?;
 
         Ok(())
     }
 
-    /// Load statistics from disk
+    /// Load statistics from disk (supports both JSON and JSONL formats)
     fn load_stats(&self) -> Result<(), String> {
         if !Path::new(&self.data_file).exists() {
             return Ok(()); // No existing data
         }
 
-        let json = fs::read_to_string(&self.data_file)
+        let content = fs::read_to_string(&self.data_file)
             .map_err(|e| format!("Failed to read stats file: {}", e))?;
-
-        let stats_vec: Vec<HourlyStats> = serde_json::from_str(&json)
-            .map_err(|e| format!("Failed to deserialize stats: {}", e))?;
 
         let mut stats = self.stats.lock()
             .map_err(|e| format!("Failed to lock stats: {}", e))?;
 
-        *stats = stats_vec.into_iter().collect();
+        // Try to parse as JSONL first (new format)
+        let mut jsonl_success = false;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<HourlyStats>(line) {
+                Ok(stat) => {
+                    stats.push_back(stat);
+                    jsonl_success = true;
+                }
+                Err(_) => {
+                    // If any line fails to parse as JSONL, fall back to old JSON format
+                    jsonl_success = false;
+                    break;
+                }
+            }
+        }
+
+        // If JSONL parsing failed, try old JSON array format for backward compatibility
+        if !jsonl_success {
+            stats.clear(); // Clear any partially loaded data
+            let stats_vec: Vec<HourlyStats> = serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse stats file (tried both JSONL and JSON formats): {}", e))?;
+
+            *stats = stats_vec.into_iter().collect();
+        }
 
         Ok(())
     }
@@ -332,7 +366,9 @@ pub async fn start_stats_collection_task(collector: Arc<HourlyStatsCollector>) {
         interval.tick().await;
 
         if let Err(e) = collector.collect_current_stats() {
-            eprintln!("Failed to collect stats: {}", e);
+            eprintln!("⚠️  Failed to collect hourly stats: {}", e);
+            eprintln!("ℹ️  Stats file: {}", collector.data_file);
+            eprintln!("ℹ️  This is not critical - the server will continue running normally");
         }
     }
 }

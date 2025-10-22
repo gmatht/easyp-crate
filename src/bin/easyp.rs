@@ -3548,6 +3548,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         format!("{}/.local/share/easyp/stats/hourly_stats.json", home_dir)
     };
+
+    // Create stats directory if it doesn't exist
+    if let Some(parent) = std::path::Path::new(&stats_file).parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("⚠️  Warning: Failed to create stats directory '{}': {}", parent.display(), e);
+            eprintln!("ℹ️  Hourly statistics collection may not work properly");
+        } else {
+            println!("📊 Stats directory ready: {}", parent.display());
+
+            // Set ownership to www-data if running as root (before dropping privileges)
+            #[cfg(unix)]
+            if is_running_as_root() {
+                if let Err(e) = std::os::unix::fs::chown(parent, Some(www_data_uid), Some(www_data_gid)) {
+                    eprintln!("⚠️  Warning: Failed to set stats directory ownership: {}", e);
+                } else {
+                    println!("📊 Stats directory ownership set to www-data: {}", parent.display());
+                }
+            }
+        }
+    }
+
     println!("DEBUG: Attempting to initialize stats collector at: {}", stats_file);
     let stats_collector = Arc::new(HourlyStatsCollector::new(stats_file));
     println!("DEBUG: Stats collector initialized successfully");
