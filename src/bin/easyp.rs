@@ -722,6 +722,8 @@ impl OnDemandHttpsServer {
                        println!("Error: Failed to set up ACME cache directory: {}", e);
                        return Err(format!("ACME cache directory setup failed: {}", e).into());
                    }
+
+
                } else {
                    // For non-root users, just create the directory without privilege operations
                    println!("ACME cache directory: {}", args.cache_dir);
@@ -3560,14 +3562,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Set ownership to www-data if running as root (before dropping privileges)
             #[cfg(unix)]
             if is_running_as_root() {
-                if let Err(e) = std::os::unix::fs::chown(parent, Some(www_data_uid), Some(www_data_gid)) {
-                    eprintln!("⚠️  Warning: Failed to set stats directory ownership: {}", e);
+                // We need to get www-data UID/GID here since they're not in scope
+                if let Ok((www_data_uid, www_data_gid)) = get_www_data_uid_gid() {
+                    if let Err(e) = std::os::unix::fs::chown(parent, Some(www_data_uid), Some(www_data_gid)) {
+                        eprintln!("⚠️  Warning: Failed to set stats directory ownership: {}", e);
+                    } else {
+                        println!("📊 Stats directory ownership set to www-data: {}", parent.display());
+                    }
                 } else {
-                    println!("📊 Stats directory ownership set to www-data: {}", parent.display());
+                    eprintln!("⚠️  Warning: Could not get www-data UID/GID for stats directory ownership");
                 }
             }
         }
     }
+
 
     println!("DEBUG: Attempting to initialize stats collector at: {}", stats_file);
     let stats_collector = Arc::new(HourlyStatsCollector::new(stats_file));
